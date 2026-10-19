@@ -293,7 +293,7 @@ export async function verifyPackagedBrowserMcp(input) {
     NodeAssert.equal(new URL(mcpConfig.url).origin, new URL(bootstrap.httpBaseUrl).origin);
     const projection = await rpc.request("orchestration.getThreadProjection", { threadId });
     NodeAssert.ok(
-      projection.thread.activeRunId,
+      projection.runs.some((run) => ["preparing", "starting", "running"].includes(run.status)),
       "Ordinary dispatch must create a live run before provider startup.",
     );
     checks.ordinaryProviderRunAndMcpCredential = true;
