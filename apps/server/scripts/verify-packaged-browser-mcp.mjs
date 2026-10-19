@@ -9,6 +9,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { execScriptSource, writeFakeCli } from "@t3tools/provider-testing/fakeCli";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
+import { chromium } from "playwright-core";
 
 function waitForRendererRpc(page, tag, accepts) {
   const sockets = new Map();
@@ -170,12 +171,28 @@ async function connectRpc(bootstrap) {
     );
   });
   const pending = new Map();
+  const previewEvents = [];
+  const eventWaiters = new Set();
+  let previewSubscriptionId;
   let sequence = 0;
   socket.addEventListener("message", (event) => {
     const decoded = JSON.parse(event.data);
     for (const message of Array.isArray(decoded) ? decoded : [decoded]) {
       if (message._tag === "Ping") {
         socket.send(JSON.stringify({ _tag: "Pong" }));
+        continue;
+      }
+      if (message._tag === "Chunk" && String(message.requestId) === previewSubscriptionId) {
+        for (const event of message.values) {
+          previewEvents.push(event);
+          for (const waiter of eventWaiters) {
+            if (!waiter.accepts(event)) continue;
+            clearTimeout(waiter.timer);
+            eventWaiters.delete(waiter);
+            waiter.resolve(event);
+          }
+        }
+        socket.send(JSON.stringify({ _tag: "Ack", requestId: message.requestId }));
         continue;
       }
       const request = pending.get(String(message.requestId));
@@ -187,6 +204,33 @@ async function connectRpc(bootstrap) {
     }
   });
   return {
+    subscribePreviewEvents: () => {
+      previewSubscriptionId = String(++sequence);
+      socket.send(
+        JSON.stringify({
+          _tag: "Request",
+          id: previewSubscriptionId,
+          tag: "subscribePreviewEvents",
+          payload: {},
+          headers: [],
+        }),
+      );
+    },
+    previewEventCount: () => previewEvents.length,
+    waitForPreviewEvent: (accepts, after = 0) => {
+      const existing = previewEvents.slice(after).find(accepts);
+      if (existing) return Promise.resolve(existing);
+      const promise = new Promise((resolve, reject) => {
+        const waiter = { accepts, resolve, reject, timer: undefined };
+        waiter.timer = setTimeout(() => {
+          eventWaiters.delete(waiter);
+          reject(new Error("Preview event milestone deadline"));
+        }, 30_000);
+        eventWaiters.add(waiter);
+      });
+      void promise.catch(() => undefined);
+      return promise;
+    },
     request: (tag, payload) =>
       new Promise((resolve, reject) => {
         const id = String(++sequence);
@@ -198,7 +242,14 @@ async function connectRpc(bootstrap) {
         socket.send(JSON.stringify({ _tag: "Request", id, tag, payload, headers: [] }));
       }),
     close: () => {
+      if (previewSubscriptionId)
+        socket.send(JSON.stringify({ _tag: "Interrupt", requestId: previewSubscriptionId }));
       socket.close();
+      for (const waiter of eventWaiters) {
+        clearTimeout(waiter.timer);
+        waiter.reject(new Error("Packaged RPC closed"));
+      }
+      eventWaiters.clear();
       for (const request of pending.values()) {
         clearTimeout(request.timer);
         request.reject(new Error("Packaged RPC closed"));
@@ -231,6 +282,8 @@ export async function verifyPackagedBrowserMcp(input) {
   let providerCreated = false;
   let credentialCapture;
   const rendererMilestones = [];
+  const boundaryErrors = [];
+  checks.additionalBoundaryFailures = [];
   const secrets = [];
   const progress = (name) => {
     phase = name;
@@ -245,6 +298,27 @@ export async function verifyPackagedBrowserMcp(input) {
     checks.profileSettingsIds = syntheticIds;
     checks[key] = syntheticIds;
     checks.rendererHash = new URL(input.mainWindow.url()).hash;
+  };
+  const boundary = async (name, run) => {
+    progress(name);
+    try {
+      await run();
+    } catch (error) {
+      boundaryErrors.push(error);
+      let message = String(error.message ?? error);
+      for (const secret of secrets) if (secret) message = message.replaceAll(secret, "[redacted]");
+      message = message
+        .replace(/Bearer\s+[^\s"'<>]+/g, "Bearer [redacted]")
+        .replace(/https?:\/\/[^\s"'<>]+/g, (value) => {
+          try {
+            const url = new URL(value);
+            return url.origin + url.pathname;
+          } catch {
+            return "[redacted URL]";
+          }
+        });
+      checks.additionalBoundaryFailures.push({ name, message });
+    }
   };
   try {
     const peer = await NodeFSP.readFile(
@@ -296,6 +370,7 @@ export async function verifyPackagedBrowserMcp(input) {
     secrets.push(bootstrap.token);
     NodeAssert.equal(new URL(bootstrap.httpBaseUrl).hostname, "127.0.0.1");
     rpc = await connectRpc(bootstrap);
+    rpc.subscribePreviewEvents();
     const config = await rpc.request("server.getConfig", {});
     const environmentId = config.environment.environmentId;
     checks.serverBrowserCapability = config.environment.capabilities.serverBrowser === true;
@@ -465,6 +540,104 @@ export async function verifyPackagedBrowserMcp(input) {
     NodeAssert.equal(beforeReveal.result, draft);
     checks.genuineMcpDesktopTimeoutFallback = true;
 
+    const verifyAttachFailure = async (closePending) => {
+      await rpc.waitForPreviewEvent(
+        (event) => event.type === "opened" && event.tabId === hidden.tabId,
+      );
+      const baseline = await rpc.request("preview.list", { threadId });
+      const baselineIds = baseline.sessions.map((session) => session.tabId).sort();
+      const eventCursor = rpc.previewEventCount();
+      const pathname = `/must-not-visit-${NodeCrypto.randomUUID()}`;
+      let settled = false;
+      const opening = client
+        .callTool(
+          {
+            name: "preview_open",
+            arguments: {
+              profileId,
+              open: true,
+              reuseExistingTab: false,
+              url: new URL(pathname, input.fixtureOrigin).href,
+            },
+          },
+          undefined,
+          { timeout: 60_000 },
+        )
+        .then((result) => {
+          settled = true;
+          return result;
+        });
+      void opening.catch(() => undefined);
+      try {
+        const opened = await rpc.waitForPreviewEvent(
+          (event) =>
+            event.type === "opened" &&
+            event.threadId === threadId &&
+            event.snapshot.profileId === profileId &&
+            !baselineIds.includes(event.tabId),
+          eventCursor,
+        );
+        NodeAssert.equal(
+          opened.snapshot.navStatus._tag,
+          "Idle",
+          "Profile recovery must stage a blank page.",
+        );
+        if (closePending) {
+          NodeAssert.equal(
+            settled,
+            false,
+            "Close must occur while the ordinary MCP open is pending.",
+          );
+          await rpc.request("preview.close", { threadId, tabId: opened.tabId });
+        }
+        const result = await opening;
+        NodeAssert.equal(
+          result.isError,
+          true,
+          "An unavailable native profile must fail its real MCP open.",
+        );
+        await rpc.waitForPreviewEvent(
+          (event) => event.type === "closed" && event.tabId === opened.tabId,
+          eventCursor,
+        );
+        const remaining = await rpc.request("preview.list", { threadId });
+        NodeAssert.deepEqual(
+          remaining.sessions.map((session) => session.tabId).sort(),
+          baselineIds,
+          "Only the attempted blank session may disappear.",
+        );
+        NodeAssert.equal(
+          (await input.getFixtureRequests()).includes(pathname),
+          false,
+          "The authenticated target must never be requested.",
+        );
+        const status = await call("preview_status", { tabId: hidden.tabId });
+        NodeAssert.equal(status.serverPageMode, "headless");
+        NodeAssert.equal(
+          status.tabs.some((tab) => tab.tabId === opened.tabId),
+          false,
+        );
+        NodeAssert.deepEqual(
+          await readHeadless(),
+          beforeReveal,
+          "The existing fallback page must survive profile recovery failure.",
+        );
+        checks[
+          closePending
+            ? "genuineMcpClosePendingOpenCleanup"
+            : "genuineMcpNativeAttachFailureCleanup"
+        ] = true;
+      } finally {
+        const remaining = await rpc.request("preview.list", { threadId });
+        for (const session of remaining.sessions)
+          if (!baselineIds.includes(session.tabId))
+            await rpc.request("preview.close", { threadId, tabId: session.tabId });
+        await opening.catch(() => undefined);
+      }
+    };
+    await boundary("hidden native profile attach failure", () => verifyAttachFailure(false));
+    await boundary("close while native open is pending", () => verifyAttachFailure(true));
+
     progress("React reveal of the same headless page");
     const targetListed = waitForRendererRpc(
       input.mainWindow,
@@ -551,7 +724,7 @@ export async function verifyPackagedBrowserMcp(input) {
 
     const nativeInputErrors = [];
     checks.nativeInputFailures = [];
-    const open = async (profile, pathname) => {
+    const nativePage = async (profile, pathname) => {
       const status = await call("preview_open", {
         profileId: profile,
         open: true,
@@ -567,6 +740,10 @@ export async function verifyPackagedBrowserMcp(input) {
       );
       const guest = input.mainWindow.locator(`webview[data-preview-server-tab="${status.tabId}"]`);
       await guest.waitFor({ state: "attached", timeout: 30_000 });
+      return { status, guest };
+    };
+    const open = async (profile, pathname) => {
+      const { status, guest } = await nativePage(profile, pathname);
       const nativeDraft = `native input ${pathname}`;
       const expression =
         '({auth: document.querySelector("#auth")?.textContent, pageId: document.querySelector("#page-id")?.textContent, draft: document.querySelector("#draft")?.value, result: document.querySelector("#result")?.textContent, activeElementId: document.activeElement?.id, hasFocus: document.hasFocus()})';
@@ -620,16 +797,247 @@ export async function verifyPackagedBrowserMcp(input) {
     const other = await open(otherProfileId, "/protected");
     NodeAssert.equal(other.value.auth, "signed-out");
     checks.genuineMcpNativeProfileIsolation = true;
+
+    await boundary("synthetic native popup authorization", async () => {
+      const state = NodeCrypto.randomUUID();
+      const { status: opener } = await nativePage(profileId, `/oauth/start?state=${state}`);
+      const initial = (
+        await call("preview_evaluate", {
+          tabId: opener.tabId,
+          expression: 'document.querySelector("#page-id").textContent',
+        })
+      ).value;
+      const windows = new Set(input.application.windows());
+      const popupReady = input.application.waitForEvent("window", {
+        predicate: (page) => !windows.has(page),
+        timeout: 30_000,
+      });
+      void popupReady.catch(() => undefined);
+      let popup;
+      try {
+        await call("preview_click", { tabId: opener.tabId, selector: "#oauth-open" });
+        popup = await popupReady;
+        checks.genuineNativePopupWindowOpened = true;
+        await popup.waitForURL(
+          (url) => url.pathname === "/oauth/authorize" && url.searchParams.get("state") === state,
+        );
+        NodeAssert.equal(
+          await popup.evaluate(() => Boolean(window.opener)),
+          true,
+          "The real native authorization window must retain its opener.",
+        );
+        const closed = popup.waitForEvent("close", { timeout: 30_000 });
+        void closed.catch(() => undefined);
+        await popup.locator("#oauth-finish").click();
+        await closed;
+        checks.genuineNativePopupWindowClosed = true;
+        await call("preview_wait_for", {
+          tabId: opener.tabId,
+          text: "complete",
+          timeoutMs: 30_000,
+        });
+        const completed = (
+          await call("preview_evaluate", {
+            tabId: opener.tabId,
+            expression:
+              '({pageId: document.querySelector("#page-id").textContent, result: document.querySelector("#oauth-result").textContent, popupClosed: window.fixtureOAuthPopup?.closed})',
+          })
+        ).value;
+        NodeAssert.equal(
+          completed.pageId,
+          initial,
+          "Authorization must preserve the original opener page.",
+        );
+        NodeAssert.equal(completed.result, "complete");
+        NodeAssert.equal(completed.popupClosed, true);
+        const signedIn = await nativePage(profileId, "/oauth/protected");
+        const signedOut = await nativePage(otherProfileId, "/oauth/protected");
+        const auth = async (tabId) =>
+          (
+            await call("preview_evaluate", {
+              tabId,
+              expression: 'document.querySelector("#oauth-auth").textContent',
+            })
+          ).value;
+        NodeAssert.equal(await auth(signedIn.status.tabId), "signed-in");
+        NodeAssert.equal(await auth(signedOut.status.tabId), "signed-out");
+        checks.genuineNativeSyntheticPopupOpenerAndCookieIsolation = true;
+        await input.mainWindow.screenshot({
+          path: NodePath.join(input.outputDir, "genuine-mcp-popup.png"),
+        });
+      } finally {
+        if (popup && !popup.isClosed()) await popup.close().catch(() => undefined);
+      }
+    });
+
+    await boundary("paired web client streams the desktop native page", async () => {
+      const response = await fetch(new URL("/api/auth/pairing-token", bootstrap.httpBaseUrl), {
+        method: "POST",
+        headers: { authorization: `Bearer ${bootstrap.token}`, "content-type": "application/json" },
+        body: JSON.stringify({ label: "Packaged browser web proof" }),
+        signal: AbortSignal.timeout(30_000),
+      });
+      NodeAssert.equal(
+        response.ok,
+        true,
+        "The normal admin API must issue the web pairing credential.",
+      );
+      const pairing = await response.json();
+      secrets.push(pairing.credential);
+      const browser = await chromium.launch({ headless: true });
+      let surface;
+      let remote;
+      try {
+        const context = await browser.newContext();
+        const settings = await input.mainWindow.evaluate(() =>
+          window.desktopBridge.getClientSettings(),
+        );
+        await context.addInitScript(
+          ({ origin, settings }) => {
+            if (location.origin === origin)
+              localStorage.setItem("t3code:client-settings:v1", JSON.stringify(settings));
+          },
+          { origin: new URL(bootstrap.httpBaseUrl).origin, settings },
+        );
+        remote = await context.newPage();
+        const profiles = waitForRendererRpc(remote, "preview.reportProfiles", (payload) =>
+          [profileId, otherProfileId].every((id) =>
+            payload.profiles?.some((profile) => profile.id === id),
+          ),
+        );
+        rendererMilestones.push(profiles);
+        const pairingUrl = new URL("/", bootstrap.httpBaseUrl);
+        pairingUrl.hash = new URLSearchParams({ token: pairing.credential }).toString();
+        await remote.goto(pairingUrl.href);
+        await profiles.promise;
+        NodeAssert.equal(await remote.evaluate(() => Boolean(window.desktopBridge)), false);
+        NodeAssert.equal(
+          await remote.evaluate(
+            async () => (await (await fetch("/api/auth/session")).json()).authenticated,
+          ),
+          true,
+        );
+        NodeAssert.equal(new URL(remote.url()).hash.includes("token="), false);
+        checks.genuinePairedWebClientAuthenticated = true;
+        const { status, guest } = await nativePage(profileId, "/public");
+        const listed = waitForRendererRpc(
+          remote,
+          "preview.list",
+          (payload) => payload.threadId === threadId,
+        );
+        rendererMilestones.push(listed);
+        await remote.goto(
+          new URL(
+            `/${encodeURIComponent(environmentId)}/${encodeURIComponent(threadId)}`,
+            bootstrap.httpBaseUrl,
+          ).href,
+        );
+        await listed.promise;
+        await remote
+          .locator(
+            '[data-chat-header] button[aria-label="Thread actions for Synthetic browser proof"]',
+          )
+          .waitFor({ state: "visible" });
+        await remote.keyboard.press(platform === "darwin" ? "Meta+Shift+j" : "Control+Shift+j");
+        surface = remote.locator(`[data-server-browser-surface="${status.tabId}"]`);
+        await surface.locator("canvas").waitFor({ state: "visible", timeout: 30_000 });
+        await remote.waitForFunction(
+          (tabId) =>
+            document
+              .querySelector(`[data-server-browser-surface="${tabId}"] canvas`)
+              ?.getContext("2d")
+              ?.getImageData(0, 0, 1, 1).data[3] > 0,
+          status.tabId,
+          { timeout: 30_000 },
+        );
+        NodeAssert.equal(await remote.locator("webview").count(), 0);
+        const read = async () =>
+          (
+            await call("preview_evaluate", {
+              tabId: status.tabId,
+              expression:
+                '({pageId: document.querySelector("#page-id").textContent, draft: document.querySelector("#draft").value})',
+            })
+          ).value;
+        const initial = await read();
+        NodeAssert.ok(initial.pageId);
+        const target = "remote browser input";
+        await call("preview_click", { tabId: status.tabId, selector: "#draft" });
+        const inputPath = `/remote-input-${NodeCrypto.randomUUID()}`;
+        const typed = input.waitForFixtureRequest(inputPath);
+        try {
+          await call("preview_evaluate", {
+            tabId: status.tabId,
+            expression: `(() => { const input = document.querySelector("#draft"); const listener = () => { if(input.value !== ${JSON.stringify(target)}) return; input.removeEventListener("input", listener); void fetch(${JSON.stringify(inputPath)}).catch(() => undefined); }; input.addEventListener("input", listener); return true; })()`,
+          });
+          await surface.getByRole("button", { name: "Take control", exact: true }).click();
+          await surface
+            .getByRole("button", { name: "Release control", exact: true })
+            .waitFor({ state: "visible" });
+          const keyboard = surface.getByRole("textbox", { name: "Browser page", exact: true });
+          await keyboard.focus();
+          await keyboard.pressSequentially(target);
+          await typed.promise;
+          await surface.getByRole("button", { name: "Release control", exact: true }).click();
+          await surface
+            .getByRole("button", { name: "Take control", exact: true })
+            .waitFor({ state: "visible" });
+        } finally {
+          typed.close();
+        }
+        const final = await read();
+        NodeAssert.equal(final.pageId, initial.pageId);
+        NodeAssert.equal(final.draft, target);
+        NodeAssert.deepEqual(
+          await guest.evaluate((element) =>
+            element.executeJavaScript(
+              '({pageId: document.querySelector("#page-id").textContent, draft: document.querySelector("#draft").value})',
+            ),
+          ),
+          final,
+        );
+        checks.genuinePairedWebClientSharesDesktopNativePage = true;
+        await remote.screenshot({ path: NodePath.join(input.outputDir, "genuine-remote-web.png") });
+      } finally {
+        if (
+          surface &&
+          (await surface
+            .getByRole("button", { name: "Release control", exact: true })
+            .isVisible()
+            .catch(() => false))
+        ) {
+          await surface
+            .getByRole("button", { name: "Release control", exact: true })
+            .click()
+            .catch(() => undefined);
+          await surface
+            .getByRole("button", { name: "Take control", exact: true })
+            .waitFor({ state: "visible" })
+            .catch(() => undefined);
+        }
+        await browser.close();
+      }
+    });
     await input.mainWindow.screenshot({
       path: NodePath.join(input.outputDir, "genuine-mcp-native.png"),
     });
     for (const tabId of nativeTabIds.splice(0)) await call("t3_preview_close", { tabId });
+    NodeAssert.equal(
+      (await rpc.request("preview.list", { threadId })).sessions.length,
+      0,
+      "All sessions, including any adopted popup, must be closed.",
+    );
+    NodeAssert.equal(
+      (await call("preview_status")).available,
+      false,
+      "No server browser page may survive the final tab cleanup.",
+    );
     checks.genuineMcpTabsClosed = true;
     checks.genuineMcpNativeTypeAndClick = nativeInputErrors.length === 0;
-    if (nativeInputErrors.length > 0)
+    if (nativeInputErrors.length + boundaryErrors.length > 0)
       throw new AggregateError(
-        nativeInputErrors,
-        `${nativeInputErrors.length} native input assertions failed; see checks.nativeInputFailures. Cookie, profile isolation and tab cleanup checks completed.`,
+        [...nativeInputErrors, ...boundaryErrors],
+        `${nativeInputErrors.length} native input assertions and ${boundaryErrors.length} additional boundaries failed; see checks.nativeInputFailures and checks.additionalBoundaryFailures. Independent checks and tab cleanup completed.`,
       );
     return { checks, threadId, nativeTabIds: [] };
   } catch (error) {

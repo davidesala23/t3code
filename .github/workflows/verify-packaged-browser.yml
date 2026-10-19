@@ -3,12 +3,17 @@ name: Verify packaged native browser
 on:
   workflow_dispatch:
     inputs:
+      platform:
+        description: Desktop platform to verify.
+        type: choice
+        options: [windows, macos, both]
+        default: both
       candidate_ref:
         description: Optional upstream commit or ref to verify; empty builds this test branch.
         type: string
         default: ""
       candidate_run_id:
-        description: Optional run built in this fork with candidate_ref empty; verifies its packaged windows-native-candidate commit without rebuilding.
+        description: Optional run built in this fork with candidate_ref empty; verifies its packaged candidate commit without rebuilding.
         type: string
         default: ""
 
@@ -18,6 +23,7 @@ permissions:
 
 jobs:
   windows:
+    if: inputs.platform != 'macos'
     runs-on: windows-2025
     timeout-minutes: 45
     steps:
@@ -64,8 +70,15 @@ jobs:
 
       - run: vp install
 
+      - name: Verify the focused integration contracts
+        run: vp test run apps/server/src/preview/ServerBrowser.test.ts apps/web/src/browser/previewRuntime.test.ts packages/contracts/src/preview.test.ts
+
       - name: Install the normal headless fallback browser
         run: node apps/server/node_modules/playwright-core/cli.js install chromium
+
+      - name: Verify compiled browser integration cases
+        working-directory: apps/web
+        run: ../../node_modules/.bin/vp test run --project browser src/browser/HostedBrowserWebview.browser.test.tsx src/components/preview/usePreviewBridge.browser.test.tsx src/components/preview/previewFallback.browser.test.tsx
 
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         if: inputs.candidate_run_id == ''
@@ -96,7 +109,7 @@ jobs:
           Expand-Archive -Path $archives[0].FullName -DestinationPath unpacked-native
 
       - name: Verify real Electron window and native preview guest
-        timeout-minutes: 5
+        timeout-minutes: 10
         shell: pwsh
         run: |
           if (Test-Path unpacked-native) {
@@ -120,5 +133,118 @@ jobs:
         if: always()
         with:
           name: windows-native-browser-evidence
+          path: native-browser-evidence/
+          if-no-files-found: warn
+
+  macos:
+    if: inputs.platform != 'windows'
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Checkout pinned test revision
+        shell: bash
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+          CANDIDATE_REF: ${{ inputs.candidate_ref }}
+          CANDIDATE_RUN: ${{ inputs.candidate_run_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init .
+          git config core.longpaths true
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git -c checkout.workers=0 checkout --detach FETCH_HEAD
+          if [[ -n "$CANDIDATE_REF" && -n "$CANDIDATE_RUN" ]]; then
+            echo 'Choose a source ref or a packaged run, not both.' >&2
+            exit 1
+          fi
+          if [[ -n "$CANDIDATE_REF" || -n "$CANDIDATE_RUN" ]]; then
+            cp apps/desktop/scripts/verify-packaged-browser.mjs "$RUNNER_TEMP/verify-packaged-browser.mjs"
+            cp apps/server/scripts/verify-packaged-browser-mcp.mjs "$RUNNER_TEMP/verify-packaged-browser-mcp.mjs"
+            if [[ -n "$CANDIDATE_RUN" ]]; then
+              [[ "$CANDIDATE_RUN" =~ ^[0-9]+$ ]]
+              candidate_sha=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN" --jq '.head_sha')
+              git fetch --no-tags --depth=1 origin "$candidate_sha"
+              gh run download "$CANDIDATE_RUN" --repo "$GITHUB_REPOSITORY" --name macos-native-candidate --dir release-native
+            else
+              git fetch --no-tags --depth=1 https://github.com/pingdotgg/t3code.git "$CANDIDATE_REF"
+            fi
+            git -c checkout.workers=0 checkout --detach FETCH_HEAD
+            cp "$RUNNER_TEMP/verify-packaged-browser.mjs" apps/desktop/scripts/verify-packaged-browser.mjs
+            cp "$RUNNER_TEMP/verify-packaged-browser-mcp.mjs" apps/server/scripts/verify-packaged-browser-mcp.mjs
+          fi
+
+      - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb
+        with:
+          node-version-file: package.json
+          cache: false
+          run-install: false
+
+      - run: vp install
+
+      - name: Verify the focused integration contracts
+        run: vp test run apps/server/src/preview/ServerBrowser.test.ts apps/web/src/browser/previewRuntime.test.ts packages/contracts/src/preview.test.ts
+
+      - name: Install the normal headless fallback browser
+        run: node apps/server/node_modules/playwright-core/cli.js install chromium
+
+      - name: Verify compiled browser integration cases
+        working-directory: apps/web
+        run: ../../node_modules/.bin/vp test run --project browser src/browser/HostedBrowserWebview.browser.test.tsx src/components/preview/usePreviewBridge.browser.test.tsx src/components/preview/previewFallback.browser.test.tsx
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        if: inputs.candidate_run_id == ''
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin
+
+      - name: Build the exact packaged candidate
+        if: inputs.candidate_run_id == ''
+        run: vp run dist:desktop:artifact --platform mac --target zip --arch arm64 --keep-stage --output-dir release-native --verbose
+
+      - name: Unpack the selected existing candidate
+        if: inputs.candidate_run_id != ''
+        run: |
+          node --input-type=module <<'NODE'
+          import * as assert from 'node:assert/strict';
+          import * as fs from 'node:fs';
+          import * as cp from 'node:child_process';
+          const archives = fs.readdirSync('release-native').filter(name => name.endsWith('.zip'));
+          assert.equal(archives.length, 1);
+          cp.execFileSync('ditto', ['-x', '-k', 'release-native/' + archives[0], 'unpacked-native']);
+          NODE
+
+      - name: Verify real Electron window and native preview guest
+        timeout-minutes: 10
+        run: |
+          node --input-type=module <<'NODE'
+          import * as assert from 'node:assert/strict';
+          import * as fs from 'node:fs';
+          import * as path from 'node:path';
+          import * as os from 'node:os';
+          import * as cp from 'node:child_process';
+          const roots = fs.existsSync('unpacked-native')
+            ? [path.resolve('unpacked-native')]
+            : fs.readdirSync(os.tmpdir()).filter(name => name.startsWith('t3code-desktop-mac-stage-')).map(name => path.join(os.tmpdir(), name, 'app/dist/mac-arm64'));
+          const apps = roots.flatMap(root => fs.existsSync(root) ? fs.readdirSync(root).filter(name => name.endsWith('.app')).map(name => path.join(root, name)) : []);
+          assert.equal(apps.length, 1, 'Expected exactly one packaged app.');
+          const executable = cp.execFileSync('plutil', ['-extract', 'CFBundleExecutable', 'raw', '-o', '-', path.join(apps[0], 'Contents/Info.plist')], {encoding:'utf8'}).trim();
+          cp.execFileSync(process.execPath, ['apps/desktop/scripts/verify-packaged-browser.mjs', path.join(apps[0], 'Contents/MacOS', executable), 'native-browser-evidence'], {stdio:'inherit'});
+          NODE
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always() && inputs.candidate_run_id == ''
+        with:
+          name: macos-native-candidate
+          path: release-native/*.zip
+          if-no-files-found: warn
+          retention-days: 3
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: macos-native-browser-evidence
           path: native-browser-evidence/
           if-no-files-found: warn

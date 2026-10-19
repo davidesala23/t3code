@@ -18,7 +18,11 @@ const Asar = NodeModule.createRequire(new URL("../../../scripts/package.json", i
 const executablePath = process.argv[2];
 NodeAssert.ok(executablePath, "Pass the packaged executable path.");
 const platform = await Effect.runPromise(HostProcess.Platform);
-NodeAssert.equal(platform, "win32", "This first preflight requires Windows isolation.");
+NodeAssert.ok(["win32", "darwin"].includes(platform), "Use a Windows or macOS package.");
+if (platform === "darwin") {
+  NodeAssert.equal(process.env.RUNNER_ENVIRONMENT, "github-hosted");
+  NodeAssert.equal(process.env.RUNNER_OS, "macOS");
+}
 const output = NodePath.resolve(process.argv[3] ?? "native-browser-evidence");
 await NodeFSP.mkdir(output, { recursive: true });
 const isolated = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-native-browser-proof-"));
@@ -27,6 +31,26 @@ const serverHome = NodePath.join(isolated, "t3-home");
 const profileId = `native-${NodeCrypto.randomUUID()}`;
 const otherProfileId = `other-${NodeCrypto.randomUUID()}`;
 await NodeFSP.mkdir(appData, { recursive: true });
+const profileLink =
+  platform === "darwin"
+    ? {
+        path: NodePath.join(NodeOS.homedir(), "Library", "Application Support", "t3code-v2"),
+        target: NodePath.join(appData, "t3code-v2"),
+      }
+    : undefined;
+if (profileLink) {
+  const exists = await NodeFSP.lstat(profileLink.path).then(
+    () => true,
+    (error) => {
+      if (error.code === "ENOENT") return false;
+      throw error;
+    },
+  );
+  NodeAssert.equal(exists, false, "The hosted Mac must have no existing T3 profile.");
+  await NodeFSP.mkdir(NodePath.dirname(profileLink.path), { recursive: true });
+  await NodeFSP.mkdir(profileLink.target);
+  await NodeFSP.symlink(profileLink.target, profileLink.path, "dir");
+}
 await NodeFSP.mkdir(NodePath.join(serverHome, "userdata"), { recursive: true });
 await NodeFSP.writeFile(
   NodePath.join(serverHome, "userdata", "client-settings.json"),
@@ -45,7 +69,7 @@ await NodeFSP.writeFile(
 );
 const environment = Object.fromEntries(
   Object.entries(process.env).filter(([key]) =>
-    /^(PATH|SYSTEMROOT|WINDIR|COMSPEC|PATHEXT|USERPROFILE|LOCALAPPDATA|TEMP|TMP|PROCESSOR_ARCHITECTURE|NUMBER_OF_PROCESSORS)$/i.test(
+    /^(PATH|HOME|USER|LOGNAME|SHELL|TMPDIR|LANG|LC_ALL|LC_CTYPE|__CF_USER_TEXT_ENCODING|SYSTEMROOT|WINDIR|COMSPEC|PATHEXT|USERPROFILE|LOCALAPPDATA|TEMP|TMP|PROCESSOR_ARCHITECTURE|NUMBER_OF_PROCESSORS)$/i.test(
       key,
     ),
   ),
@@ -60,7 +84,8 @@ const sourceHead = NodeChildProcess.execFileSync("git", ["rev-parse", "HEAD"], {
 }).trim();
 const requests = [];
 const fixture = NodeHttp.createServer((request, response) => {
-  const pathname = new URL(request.url, "http://fixture.invalid").pathname;
+  const fixtureUrl = new URL(request.url, "http://fixture.invalid");
+  const pathname = fixtureUrl.pathname;
   requests.push(pathname);
   response.setHeader("content-type", "text/html; charset=utf-8");
   const signedIn =
@@ -72,8 +97,43 @@ const fixture = NodeHttp.createServer((request, response) => {
       "native_fixture_session=synthetic-login; Path=/; HttpOnly; SameSite=Lax",
     );
   }
+  const state = JSON.stringify(fixtureUrl.searchParams.get("state"));
+  let oauth = "";
+  if (pathname === "/oauth/start") {
+    oauth = `<button id="oauth-open">Sign in with fixture</button><output id="oauth-result">pending</output><script>
+      const state = ${state};
+      document.querySelector('#oauth-open').onclick = () => {
+        const url = new URL('/oauth/authorize', location.origin);
+        url.searchParams.set('state', state);
+        window.fixtureOAuthPopup = window.open(url.href, 'fixture-oauth', 'popup,width=520,height=600');
+      };
+      window.addEventListener('message', event => {
+        if (event.origin !== location.origin || event.source !== window.fixtureOAuthPopup || event.data?.type !== 'fixture-oauth' || event.data.state !== state) return;
+        document.querySelector('#oauth-result').textContent = 'complete';
+      });
+    </script>`;
+  }
+  if (pathname === "/oauth/authorize") {
+    response.setHeader(
+      "set-cookie",
+      "native_fixture_oauth=synthetic-login; Path=/; HttpOnly; SameSite=Lax",
+    );
+    oauth = `<p id="opener-present"></p><button id="oauth-finish">Finish sign in</button><script>
+      document.querySelector('#opener-present').textContent = window.opener ? 'present' : 'missing';
+      document.querySelector('#oauth-finish').onclick = () => {
+        window.opener.postMessage({type:'fixture-oauth', state:${state}}, location.origin);
+        window.close();
+      };
+    </script>`;
+  }
+  if (pathname === "/oauth/protected") {
+    const authenticated = /(?:^|;\s*)native_fixture_oauth=synthetic-login(?:;|$)/.test(
+      request.headers.cookie ?? "",
+    );
+    oauth = `<p id="oauth-auth">${authenticated ? "signed-in" : "signed-out"}</p>`;
+  }
   response.end(
-    `<!doctype html><title>Native browser verification</title><p id="auth">${signedIn ? "signed-in" : "signed-out"}</p><p id="page-id">${NodeCrypto.randomUUID()}</p><label>Draft <input id="draft"></label><button id="apply" onclick="document.querySelector('#result').textContent=document.querySelector('#draft').value">Apply</button><output id="result"></output>`,
+    `<!doctype html><title>Native browser verification</title><p id="auth">${signedIn ? "signed-in" : "signed-out"}</p><p id="page-id">${NodeCrypto.randomUUID()}</p><label>Draft <input id="draft"></label><button id="apply" onclick="document.querySelector('#result').textContent=document.querySelector('#draft').value">Apply</button><output id="result"></output>${oauth}`,
   );
 });
 const waitForFixtureRequest = (pathname) => {
@@ -113,6 +173,7 @@ try {
   application = await _electron.launch({
     executablePath: NodePath.resolve(executablePath),
     env: environment,
+    recordVideo: { dir: NodePath.join(output, "video"), size: { width: 1024, height: 720 } },
     timeout: 60_000,
   });
   const window = await application.firstWindow();
@@ -133,9 +194,16 @@ try {
     sourceHead.slice(0, 12),
     "Packaged app must match the checked-out commit.",
   );
-  NodeAssert.equal(NodePath.relative(appData, identity.userData).startsWith(".."), false);
-  NodeAssert.notEqual(NodePath.relative(appData, identity.userData), "");
-  NodeAssert.equal(NodePath.isAbsolute(NodePath.relative(appData, identity.userData)), false);
+  identity.canonicalUserData = await NodeFSP.realpath(identity.userData);
+  const relativeProfile = NodePath.relative(
+    await NodeFSP.realpath(appData),
+    identity.canonicalUserData,
+  );
+  NodeAssert.equal(relativeProfile.startsWith(".."), false);
+  NodeAssert.notEqual(relativeProfile, "");
+  NodeAssert.equal(NodePath.isAbsolute(relativeProfile), false);
+  if (profileLink)
+    NodeAssert.equal(identity.canonicalUserData, await NodeFSP.realpath(profileLink.target));
   report.checks.packagedIdentityAndIsolation = identity;
 
   const runtimeTabId = `packaged-proof-${NodeCrypto.randomUUID()}`;
@@ -226,6 +294,7 @@ try {
   }, runtimeTabId);
   report.scope = "packaged native preflight and live MCP browser checks";
   await verifyPackagedBrowserMcp({
+    application,
     mainWindow: window,
     isolatedRoot: isolated,
     fixtureOrigin: origin,
@@ -234,6 +303,7 @@ try {
     profileId,
     otherProfileId,
     waitForFixtureRequest,
+    getFixtureRequests: () => [...requests],
   });
   report.status = "passed";
 } catch (error) {
@@ -264,5 +334,10 @@ try {
   console.log(JSON.stringify(report));
   if (application) await application.close().catch(() => undefined);
   await new Promise((resolve) => fixture.close(resolve));
+  if (profileLink) {
+    NodeAssert.ok((await NodeFSP.lstat(profileLink.path)).isSymbolicLink());
+    NodeAssert.equal(await NodeFSP.readlink(profileLink.path), profileLink.target);
+    await NodeFSP.unlink(profileLink.path);
+  }
   await NodeFSP.rm(isolated, { recursive: true, force: true });
 }
