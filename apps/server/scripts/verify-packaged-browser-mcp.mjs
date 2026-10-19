@@ -549,6 +549,8 @@ export async function verifyPackagedBrowserMcp(input) {
     await call("t3_preview_close", { tabId: hidden.tabId });
     nativeTabIds.splice(nativeTabIds.indexOf(hidden.tabId), 1);
 
+    const nativeInputErrors = [];
+    checks.nativeInputFailures = [];
     const open = async (profile, pathname) => {
       const status = await call("preview_open", {
         profileId: profile,
@@ -591,16 +593,17 @@ export async function verifyPackagedBrowserMcp(input) {
         visible,
         "Real MCP and the React-mounted native guest must see one page.",
       );
-      NodeAssert.equal(
-        value.draft,
-        nativeDraft,
-        `Native draft must retain typed input: ${pathname}`,
-      );
-      NodeAssert.equal(
-        value.result,
-        nativeDraft,
-        `Native Apply must show the typed input: ${pathname}`,
-      );
+      for (const [field, message] of [
+        ["draft", `Native draft must retain typed input: ${pathname}`],
+        ["result", `Native Apply must show the typed input: ${pathname}`],
+      ]) {
+        try {
+          NodeAssert.equal(value[field], nativeDraft, message);
+        } catch (error) {
+          nativeInputErrors.push(error);
+          checks.nativeInputFailures.push({ pathname, message: String(error.message ?? error) });
+        }
+      }
       return { tabId: status.tabId, value };
     };
 
@@ -613,7 +616,6 @@ export async function verifyPackagedBrowserMcp(input) {
     NodeAssert.equal(restored.value.auth, "signed-in");
     checks.genuineMcpNativeCookieReuse = true;
     checks.genuineMcpAndReactShareNativePage = true;
-    checks.genuineMcpNativeTypeAndClick = true;
     progress("genuine MCP profile isolation");
     const other = await open(otherProfileId, "/protected");
     NodeAssert.equal(other.value.auth, "signed-out");
@@ -623,6 +625,12 @@ export async function verifyPackagedBrowserMcp(input) {
     });
     for (const tabId of nativeTabIds.splice(0)) await call("t3_preview_close", { tabId });
     checks.genuineMcpTabsClosed = true;
+    checks.genuineMcpNativeTypeAndClick = nativeInputErrors.length === 0;
+    if (nativeInputErrors.length > 0)
+      throw new AggregateError(
+        nativeInputErrors,
+        `${nativeInputErrors.length} native input assertions failed; see checks.nativeInputFailures. Cookie, profile isolation and tab cleanup checks completed.`,
+      );
     return { checks, threadId, nativeTabIds: [] };
   } catch (error) {
     await observeProfileSettings("profileSettingsAtFailureIds").catch(() => {
