@@ -23,6 +23,7 @@ const observeNativeGuestDestruction = (application, ids) =>
     const guests = current();
     const before = guests.map((guest) => ({
       id: guest.id,
+      type: guest.getType(),
       isDestroyed: guest.isDestroyed(),
       debuggerAttached: guest.debugger.isAttached(),
     }));
@@ -66,8 +67,125 @@ const observeNativeGuestDestruction = (application, ids) =>
       })),
     }));
     void completion.catch(() => undefined);
-    return { completion };
+    return { before, completion };
   }, ids);
+
+async function readNativeGuestInventory(input) {
+  const [webContents, dom] = await Promise.allSettled([
+    input.application.evaluate(({ webContents }) =>
+      webContents
+        .getAllWebContents()
+        .filter((guest) => guest.getType() === "webview")
+        .map((guest) => {
+          let url;
+          try {
+            const parsed = new URL(guest.getURL());
+            url =
+              parsed.origin === "null"
+                ? `${parsed.protocol}${parsed.pathname}`
+                : parsed.origin + parsed.pathname;
+          } catch {
+            url = "unavailable";
+          }
+          return {
+            id: guest.id,
+            type: guest.getType(),
+            isDestroyed: guest.isDestroyed(),
+            debuggerAttached: guest.debugger.isAttached(),
+            hostWebContentsId: guest.hostWebContents?.id ?? null,
+            url,
+          };
+        }),
+    ),
+    input.mainWindow.evaluate(() =>
+      Array.from(document.querySelectorAll("webview"), (guest) => {
+        let webContentsId = null;
+        let readError;
+        try {
+          webContentsId = guest.getWebContentsId();
+        } catch (error) {
+          readError = String(error.message ?? error);
+        }
+        return {
+          elementId: guest.id,
+          runtimeTabId: guest.dataset.previewTab ?? null,
+          tabId: guest.dataset.previewServerTab ?? null,
+          webContentsId,
+          isConnected: guest.isConnected,
+          ...(readError ? { readError } : {}),
+        };
+      }),
+    ),
+  ]);
+  return {
+    webContents:
+      webContents.status === "fulfilled"
+        ? webContents.value
+        : { readError: String(webContents.reason.message ?? webContents.reason) },
+    dom:
+      dom.status === "fulfilled"
+        ? dom.value
+        : { readError: String(dom.reason.message ?? dom.reason) },
+  };
+}
+
+function captureRendererPreviewChunks(page) {
+  const sockets = new Map();
+  const diagnostics = { subscriptionCount: 0, parseFailureCount: 0, chunks: [] };
+  let socketCount = 0;
+  const onSocket = (socket) => {
+    const socketIndex = ++socketCount;
+    const subscriptionIds = new Set();
+    const messages = (frame) => {
+      try {
+        const parsed = JSON.parse(
+          typeof frame.payload === "string" ? frame.payload : frame.payload.toString("utf8"),
+        );
+        return Array.isArray(parsed) ? parsed : [parsed];
+      } catch {
+        diagnostics.parseFailureCount++;
+        return [];
+      }
+    };
+    const sent = (frame) => {
+      for (const message of messages(frame)) {
+        if (message._tag !== "Request" || message.tag !== "subscribePreviewEvents") continue;
+        subscriptionIds.add(String(message.id));
+        diagnostics.subscriptionCount++;
+      }
+    };
+    const received = (frame) => {
+      for (const message of messages(frame)) {
+        if (message._tag !== "Chunk" || !subscriptionIds.has(String(message.requestId))) continue;
+        diagnostics.chunks.push({
+          socketIndex,
+          valuesLength: message.values.length,
+          events: message.values.map(({ type, tabId, revision, serverEpoch }) => ({
+            type,
+            tabId,
+            revision,
+            serverEpoch,
+          })),
+        });
+      }
+    };
+    sockets.set(socket, { sent, received });
+    socket.on("framesent", sent);
+    socket.on("framereceived", received);
+  };
+  page.on("websocket", onSocket);
+  return {
+    diagnostics,
+    close: () => {
+      page.off("websocket", onSocket);
+      for (const [socket, { sent, received }] of sockets) {
+        socket.off("framesent", sent);
+        socket.off("framereceived", received);
+      }
+      sockets.clear();
+    },
+  };
+}
 
 function waitForRendererRpc(page, tag, accepts) {
   const sockets = new Map();
@@ -230,6 +348,7 @@ async function connectRpc(bootstrap) {
   });
   const pending = new Map();
   const previewEvents = [];
+  const previewChunks = [];
   const eventWaiters = new Set();
   let previewSubscriptionId;
   let sequence = 0;
@@ -241,6 +360,10 @@ async function connectRpc(bootstrap) {
         continue;
       }
       if (message._tag === "Chunk" && String(message.requestId) === previewSubscriptionId) {
+        previewChunks.push({
+          valuesLength: message.values.length,
+          events: message.values.map(({ type, tabId }) => ({ type, tabId })),
+        });
         for (const event of message.values) {
           previewEvents.push(event);
           for (const waiter of eventWaiters) {
@@ -275,6 +398,13 @@ async function connectRpc(bootstrap) {
       );
     },
     previewEventCount: () => previewEvents.length,
+    previewEventsSince: (after) =>
+      previewEvents.slice(after).map(({ type, tabId }) => ({ type, tabId })),
+    previewChunkDiagnostics: () =>
+      previewChunks.map((chunk) => ({
+        ...chunk,
+        events: chunk.events.map((event) => ({ ...event })),
+      })),
     waitForPreviewEvent: (accepts, after = 0) => {
       const existing = previewEvents.slice(after).find(accepts);
       if (existing) return Promise.resolve(existing);
@@ -345,6 +475,9 @@ export async function verifyPackagedBrowserMcp(input) {
   const rendererMilestones = [];
   const boundaryErrors = [];
   checks.additionalBoundaryFailures = [];
+  checks.nativeGuestCloseSteps = [];
+  const rendererPreview = captureRendererPreviewChunks(input.mainWindow);
+  checks.rendererPreviewEvents = rendererPreview.diagnostics;
   const secrets = [];
   const progress = (name) => {
     phase = name;
@@ -579,9 +712,26 @@ export async function verifyPackagedBrowserMcp(input) {
       }),
     );
     const call = async (name, args = {}) => {
-      const result = await client.callTool({ name, arguments: args }, undefined, {
-        timeout: 60_000,
-      });
+      const eventCursor = rpc.previewEventCount();
+      const rendererChunkCursor = rendererPreview.diagnostics.chunks.length;
+      let result;
+      try {
+        result = await client.callTool({ name, arguments: args }, undefined, {
+          timeout: 60_000,
+        });
+      } finally {
+        if (name === "t3_preview_close") {
+          checks.nativeGuestCloseSteps.push({
+            tabId: args.tabId,
+            toolReturned: result !== undefined,
+            isError: result?.isError ?? false,
+            eventCursor,
+            events: rpc.previewEventsSince(eventCursor),
+            rendererChunkCursor,
+            rendererChunks: rendererPreview.diagnostics.chunks.slice(rendererChunkCursor),
+          });
+        }
+      }
       NodeAssert.ok(!result.isError, `Real MCP tool failed: ${name}`);
       if (result.structuredContent !== undefined) return result.structuredContent;
       const text = result.content?.find((part) => part.type === "text")?.text;
@@ -1064,6 +1214,7 @@ export async function verifyPackagedBrowserMcp(input) {
       });
       void popupReady.catch(() => undefined);
       let popup;
+      let clickClosedError;
       try {
         await call("preview_click", { tabId: opener.tabId, selector: "#oauth-open" });
         popup = await popupReady;
@@ -1078,7 +1229,17 @@ export async function verifyPackagedBrowserMcp(input) {
         );
         const closed = popup.waitForEvent("close", { timeout: 30_000 });
         void closed.catch(() => undefined);
-        await popup.locator("#oauth-finish").click();
+        try {
+          await popup.locator("#oauth-finish").click();
+        } catch (error) {
+          if (
+            !String(error.message ?? error).startsWith(
+              "locator.click: Target page, context or browser has been closed",
+            )
+          )
+            throw error;
+          clickClosedError = error;
+        }
         await closed;
         checks.genuineNativePopupWindowClosed = true;
         await call("preview_wait_for", {
@@ -1111,10 +1272,19 @@ export async function verifyPackagedBrowserMcp(input) {
           ).value;
         NodeAssert.equal(await auth(signedIn.status.tabId), "signed-in");
         NodeAssert.equal(await auth(signedOut.status.tabId), "signed-out");
+        if (clickClosedError) checks.nativePopupClickClosedCandidateAccepted = true;
         checks.genuineNativeSyntheticPopupOpenerAndCookieIsolation = true;
         await input.mainWindow.screenshot({
           path: NodePath.join(input.outputDir, "genuine-mcp-popup.png"),
         });
+      } catch (error) {
+        if (clickClosedError)
+          throw new AggregateError(
+            [clickClosedError, error],
+            `Popup closed during the real click, but authorization completion was not proven: ${String(error.message ?? error)}`,
+            { cause: error },
+          );
+        throw error;
       } finally {
         if (popup && !popup.isClosed()) await popup.close().catch(() => undefined);
       }
@@ -1285,7 +1455,22 @@ export async function verifyPackagedBrowserMcp(input) {
     });
     const nativeDestruction = await observeNativeGuestDestruction(input.application);
     try {
+      checks.nativeGuestCleanupBefore = {
+        observed: await nativeDestruction.evaluate(({ before }) => before),
+        ...(await readNativeGuestInventory(input)),
+      };
       for (const tabId of nativeTabIds.splice(0)) await call("t3_preview_close", { tabId });
+      try {
+        checks.nativeGuestCleanupAfterCloseSessions = (
+          await rpc.request("preview.list", { threadId })
+        ).sessions.map(({ tabId, runtime, serverPageMode }) => ({
+          tabId,
+          runtime,
+          serverPageMode,
+        }));
+      } catch (error) {
+        checks.nativeGuestCleanupAfterCloseSessions = { readError: String(error.message ?? error) };
+      }
       const destruction = await nativeDestruction.evaluate(({ completion }) => completion);
       const remaining = await input.application.evaluate(({ webContents }) =>
         webContents
@@ -1309,6 +1494,15 @@ export async function verifyPackagedBrowserMcp(input) {
       );
       checks.genuineNativeGuestsDestroyed = true;
     } finally {
+      try {
+        checks.nativeGuestCleanupAfter = {
+          ...(await readNativeGuestInventory(input)),
+          events: rpc.previewEventsSince(0),
+          chunks: rpc.previewChunkDiagnostics(),
+        };
+      } catch (error) {
+        checks.nativeGuestCleanupAfter = { readError: String(error.message ?? error) };
+      }
       await nativeDestruction.dispose();
     }
     NodeAssert.equal(
@@ -1383,5 +1577,6 @@ export async function verifyPackagedBrowserMcp(input) {
     }
     credentialCapture?.close();
     for (const milestone of rendererMilestones) milestone.close();
+    rendererPreview.close();
   }
 }
