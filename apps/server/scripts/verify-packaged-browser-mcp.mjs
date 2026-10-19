@@ -11,6 +11,60 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
 import { chromium } from "playwright-core";
 
+const observeNativeGuestDestruction = (application, ids) =>
+  application.evaluateHandle(({ webContents }, selectedIds) => {
+    const current = () =>
+      webContents
+        .getAllWebContents()
+        .filter(
+          (guest) =>
+            guest.getType() === "webview" && (!selectedIds || selectedIds.includes(guest.id)),
+        );
+    const guests = current();
+    const before = guests.map((guest) => ({
+      id: guest.id,
+      isDestroyed: guest.isDestroyed(),
+      debuggerAttached: guest.debugger.isAttached(),
+    }));
+    const completion = Promise.all(
+      guests.map(
+        (guest) =>
+          new Promise((resolve, reject) => {
+            let debuggerDetached = !guest.debugger.isAttached();
+            const detached = () => {
+              debuggerDetached = true;
+            };
+            const cleanup = () => {
+              clearTimeout(timer);
+              guest.debugger.off("detach", detached);
+              guest.off("destroyed", destroyed);
+            };
+            const destroyed = () => {
+              cleanup();
+              resolve({ id: guest.id, isDestroyed: guest.isDestroyed(), debuggerDetached });
+            };
+            const timer = setTimeout(() => {
+              cleanup();
+              reject(new Error(`Native guest destruction deadline: ${guest.id}`));
+            }, 30_000);
+            guest.debugger.on("detach", detached);
+            guest.once("destroyed", destroyed);
+            if (guest.isDestroyed()) destroyed();
+          }),
+      ),
+    ).then((destroyed) => ({
+      before,
+      destroyed,
+      remaining: current().map((guest) => ({
+        id: guest.id,
+        isDestroyed: guest.isDestroyed(),
+        debuggerAttached: guest.debugger.isAttached(),
+      })),
+    }));
+    void completion.catch(() => undefined);
+    return { completion };
+  }, ids);
+
 function waitForRendererRpc(page, tag, accepts) {
   const sockets = new Map();
   const observedRequestTags = new Set();
@@ -281,6 +335,9 @@ export async function verifyPackagedBrowserMcp(input) {
   let client;
   let providerCreated = false;
   let credentialCapture;
+  let lateRuntimeTabId;
+  let lateNativeElementId;
+  let lateNativeGuestId;
   const rendererMilestones = [];
   const boundaryErrors = [];
   checks.additionalBoundaryFailures = [];
@@ -318,6 +375,41 @@ export async function verifyPackagedBrowserMcp(input) {
           }
         });
       checks.additionalBoundaryFailures.push({ name, message });
+    }
+  };
+  const closeLateNativeGuest = async () => {
+    if (!lateRuntimeTabId) return;
+    const destruction = await observeNativeGuestDestruction(
+      input.application,
+      lateNativeGuestId === undefined ? undefined : [lateNativeGuestId],
+    );
+    try {
+      await input.mainWindow.evaluate(
+        async ({ runtimeTabId, elementId }) => {
+          try {
+            await window.desktopBridge.preview.closeTab(runtimeTabId);
+          } finally {
+            document.getElementById(elementId)?.remove();
+          }
+        },
+        { runtimeTabId: lateRuntimeTabId, elementId: lateNativeElementId },
+      );
+      const result = await destruction.evaluate(({ completion }) => completion);
+      checks.lateNativeGuestCleanup = result;
+      NodeAssert.equal(
+        result.remaining.length,
+        0,
+        "The late native guest must be destroyed after cleanup.",
+      );
+      NodeAssert.ok(
+        result.destroyed.every((guest) => guest.isDestroyed && guest.debuggerDetached),
+        "The late native guest and its debugger must both be released.",
+      );
+    } finally {
+      await destruction.dispose();
+      lateRuntimeTabId = undefined;
+      lateNativeElementId = undefined;
+      lateNativeGuestId = undefined;
     }
   };
   try {
@@ -502,21 +594,95 @@ export async function verifyPackagedBrowserMcp(input) {
     );
 
     progress("genuine MCP desktop timeout fallback");
-    const hidden = await call("preview_open", {
+    const initialEventCursor = rpc.previewEventCount();
+    let initialOpenSettled = false;
+    const initialOpening = call("preview_open", {
       open: false,
       reuseExistingTab: false,
       url: new URL("/public", input.fixtureOrigin).href,
-    });
+    }).then(
+      (status) => {
+        initialOpenSettled = true;
+        return status;
+      },
+      (error) => {
+        initialOpenSettled = true;
+        throw error;
+      },
+    );
+    void initialOpening.catch(() => undefined);
+    const pending = await rpc.waitForPreviewEvent(
+      (event) =>
+        event.type === "opened" &&
+        event.threadId === threadId &&
+        event.snapshot.runtime === "server",
+      initialEventCursor,
+    );
+    lateRuntimeTabId = JSON.stringify([
+      environmentId,
+      threadId,
+      pending.serverEpoch,
+      pending.tabId,
+    ]);
+    lateNativeElementId = `late-native-${NodeCrypto.randomUUID()}`;
+    lateNativeGuestId = await input.mainWindow.evaluate(
+      async (input) => {
+        const bridge = window.desktopBridge.preview;
+        const config = await bridge.getPreviewConfig(input.environmentId, input.profileId);
+        await bridge.createTab(input.runtimeTabId, { serverTab: input.serverTab });
+        const guest = document.createElement("webview");
+        guest.id = input.elementId;
+        guest.setAttribute("partition", config.partition);
+        guest.setAttribute("webpreferences", config.webPreferences);
+        guest.setAttribute("data-preview-server-tab", input.serverTab.tabId);
+        if (config.preloadUrl) guest.setAttribute("preload", config.preloadUrl);
+        guest.style.cssText = "position:fixed;inset:60px 20px 20px;z-index:100000;background:white";
+        const ready = new Promise((resolve, reject) => {
+          const timer = setTimeout(
+            () => reject(new Error("Late native blank guest readiness deadline")),
+            15_000,
+          );
+          guest.addEventListener(
+            "dom-ready",
+            () => {
+              clearTimeout(timer);
+              resolve();
+            },
+            { once: true },
+          );
+          guest.addEventListener(
+            "did-fail-load",
+            (event) => {
+              clearTimeout(timer);
+              reject(new Error(event.errorDescription));
+            },
+            { once: true },
+          );
+        });
+        guest.setAttribute("src", "about:blank");
+        document.body.append(guest);
+        await ready;
+        return guest.getWebContentsId();
+      },
+      {
+        environmentId,
+        profileId: pending.snapshot.profileId ?? "default",
+        runtimeTabId: lateRuntimeTabId,
+        elementId: lateNativeElementId,
+        serverTab: { threadId, tabId: pending.tabId },
+      },
+    );
+    NodeAssert.equal(
+      initialOpenSettled,
+      false,
+      "The blank native guest must be ready while the real MCP attach is still pending.",
+    );
+    const hidden = await initialOpening;
     NodeAssert.ok(hidden.tabId);
     nativeTabIds.push(hidden.tabId);
     NodeAssert.equal(hidden.serverPageMode, "headless", "An unvisited thread must fall back.");
     const hiddenGuest = input.mainWindow.locator(
       `webview[data-preview-server-tab="${hidden.tabId}"]`,
-    );
-    NodeAssert.equal(
-      await hiddenGuest.count(),
-      0,
-      "Hidden headless page must have no native guest.",
     );
     const readHeadless = async () =>
       (
@@ -539,6 +705,86 @@ export async function verifyPackagedBrowserMcp(input) {
     NodeAssert.equal(beforeReveal.draft, draft);
     NodeAssert.equal(beforeReveal.result, draft);
     checks.genuineMcpDesktopTimeoutFallback = true;
+    try {
+      await boundary("late native registration preserves the headless page", async () => {
+        const publicRequests = (await input.getFixtureRequests()).filter(
+          (path) => path === "/public",
+        ).length;
+        const attachment = await input.application.evaluateHandle(({ webContents }, guestId) => {
+          const guest = webContents.fromId(guestId);
+          if (!guest?.debugger.isAttached())
+            throw new Error(
+              "The blank guest must have its prepared native debugger before registration.",
+            );
+          const debuggee = guest.debugger;
+          let close;
+          const attached = new Promise((resolve, reject) => {
+            const listener = (eventName) => {
+              if (eventName !== "message") return;
+              close();
+              resolve();
+            };
+            const timer = setTimeout(() => {
+              close();
+              reject(new Error("Late native host attachment listener deadline"));
+            }, 30_000);
+            close = () => {
+              clearTimeout(timer);
+              debuggee.off("newListener", listener);
+            };
+            debuggee.on("newListener", listener);
+          });
+          void attached.catch(() => undefined);
+          return { attached, close: () => close() };
+        }, lateNativeGuestId);
+        try {
+          await input.mainWindow.evaluate(
+            async ({ runtimeTabId, guestId }) =>
+              window.desktopBridge.preview.registerWebview(runtimeTabId, guestId),
+            { runtimeTabId: lateRuntimeTabId, guestId: lateNativeGuestId },
+          );
+          await attachment.evaluate(({ attached }) => attached);
+        } finally {
+          await attachment.evaluate(({ close }) => close());
+          await attachment.dispose();
+        }
+        const status = await call("preview_status", { tabId: hidden.tabId });
+        NodeAssert.equal(status.serverPageMode, "headless");
+        NodeAssert.deepEqual(
+          await readHeadless(),
+          beforeReveal,
+          "Late registration must preserve the same headless page, draft and applied result.",
+        );
+        const native = await input.application.evaluate(({ webContents }, guestId) => {
+          const guest = webContents.fromId(guestId);
+          return {
+            url: guest.getURL(),
+            isDestroyed: guest.isDestroyed(),
+            debuggerAttached: guest.debugger.isAttached(),
+          };
+        }, lateNativeGuestId);
+        NodeAssert.equal(native.isDestroyed, false);
+        NodeAssert.equal(native.debuggerAttached, true);
+        NodeAssert.equal(
+          native.url,
+          "about:blank",
+          "Late registration must not duplicate the target into a native page.",
+        );
+        NodeAssert.equal(
+          (await input.getFixtureRequests()).filter((path) => path === "/public").length,
+          publicRequests,
+          "Late registration must not request the target again.",
+        );
+        checks.genuineMcpLateNativeRegistrationPreservesHeadlessPage = true;
+      });
+    } finally {
+      await boundary("late native guest cleanup", closeLateNativeGuest);
+    }
+    NodeAssert.equal(
+      await hiddenGuest.count(),
+      0,
+      "Hidden headless page must have no native guest after the late-registration probe.",
+    );
 
     const verifyAttachFailure = async (closePending) => {
       await rpc.waitForPreviewEvent(
@@ -1033,7 +1279,34 @@ export async function verifyPackagedBrowserMcp(input) {
     await input.mainWindow.screenshot({
       path: NodePath.join(input.outputDir, "genuine-mcp-native.png"),
     });
-    for (const tabId of nativeTabIds.splice(0)) await call("t3_preview_close", { tabId });
+    const nativeDestruction = await observeNativeGuestDestruction(input.application);
+    try {
+      for (const tabId of nativeTabIds.splice(0)) await call("t3_preview_close", { tabId });
+      const destruction = await nativeDestruction.evaluate(({ completion }) => completion);
+      const remaining = await input.application.evaluate(({ webContents }) =>
+        webContents
+          .getAllWebContents()
+          .filter((guest) => guest.getType() === "webview")
+          .map((guest) => ({
+            id: guest.id,
+            isDestroyed: guest.isDestroyed(),
+            debuggerAttached: guest.debugger.isAttached(),
+          })),
+      );
+      checks.nativeGuestCleanup = { ...destruction, remaining };
+      NodeAssert.equal(
+        remaining.length,
+        0,
+        "All native webview guests must be destroyed after the real tab closures.",
+      );
+      NodeAssert.ok(
+        destruction.destroyed.every((guest) => guest.isDestroyed && guest.debuggerDetached),
+        "Every observed native guest must be destroyed and its debugger detached.",
+      );
+      checks.genuineNativeGuestsDestroyed = true;
+    } finally {
+      await nativeDestruction.dispose();
+    }
     NodeAssert.equal(
       (await rpc.request("preview.list", { threadId })).sessions.length,
       0,
@@ -1061,6 +1334,9 @@ export async function verifyPackagedBrowserMcp(input) {
     detail = detail.replace(/Bearer\s+[^\s"'<>]+/g, "Bearer [redacted]");
     throw new Error(`Packaged MCP failed during ${phase}: ${detail}`, { cause: error });
   } finally {
+    await closeLateNativeGuest().catch((error) => {
+      checks.lateNativeCleanupFailure = String(error.message ?? error);
+    });
     if (client) {
       for (const tabId of nativeTabIds)
         await client

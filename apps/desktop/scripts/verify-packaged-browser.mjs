@@ -177,9 +177,16 @@ try {
     timeout: 60_000,
   });
   const window = await application.firstWindow();
-  await window.waitForFunction(() => Boolean(window.desktopBridge?.preview), undefined, {
-    timeout: 60_000,
-  });
+  await window.waitForFunction(
+    () =>
+      Boolean(
+        window.desktopBridge?.preview &&
+        window.desktopBridge.getLocalEnvironmentBootstraps().find((entry) => entry.id === "primary")
+          ?.httpBaseUrl,
+      ),
+    undefined,
+    { timeout: 60_000 },
+  );
   const identity = await application.evaluate(({ app }) => ({
     packaged: app.isPackaged,
     userData: app.getPath("userData"),
@@ -206,12 +213,21 @@ try {
     NodeAssert.equal(identity.canonicalUserData, await NodeFSP.realpath(profileLink.target));
   report.checks.packagedIdentityAndIsolation = identity;
 
+  const httpBaseUrl = await window.evaluate(
+    () =>
+      window.desktopBridge.getLocalEnvironmentBootstraps().find((entry) => entry.id === "primary")
+        .httpBaseUrl,
+  );
+  const descriptorResponse = await fetch(new URL("/.well-known/t3/environment", httpBaseUrl));
+  NodeAssert.equal(descriptorResponse.ok, true);
+  const { environmentId } = await descriptorResponse.json();
+  NodeAssert.ok(environmentId);
   const runtimeTabId = `packaged-proof-${NodeCrypto.randomUUID()}`;
   const serverTab = { threadId: NodeCrypto.randomUUID(), tabId: NodeCrypto.randomUUID() };
   const guestId = await window.evaluate(
     async (input) => {
       const bridge = window.desktopBridge.preview;
-      const config = await bridge.getPreviewConfig(input.environmentId, "default");
+      const config = await bridge.getPreviewConfig(input.environmentId, input.profileId);
       await bridge.createTab(input.runtimeTabId, { serverTab: input.serverTab });
       const guest = document.createElement("webview");
       guest.id = "packaged-native-proof";
@@ -232,10 +248,18 @@ try {
       await ready;
       const id = guest.getWebContentsId();
       await bridge.registerWebview(input.runtimeTabId, id);
+      await bridge.navigate(input.runtimeTabId, input.loginUrl);
       await bridge.navigate(input.runtimeTabId, input.url);
       return id;
     },
-    { runtimeTabId, serverTab, environmentId: NodeCrypto.randomUUID(), url: origin },
+    {
+      runtimeTabId,
+      serverTab,
+      environmentId,
+      profileId,
+      loginUrl: new URL("/login", origin).href,
+      url: new URL("/protected", origin).href,
+    },
   );
 
   const controlled = await application.evaluate(
@@ -256,17 +280,27 @@ try {
           'document.querySelector("#draft").value = "same native page"; document.querySelector("#apply").click(); document.querySelector("#result").textContent',
         returnByValue: true,
       });
+      const authentication = await guest.debugger.sendCommand("Runtime.evaluate", {
+        expression: 'document.querySelector("#auth").textContent',
+        returnByValue: true,
+      });
       return {
         type: guest.getType(),
         debuggerAttached: guest.debugger.isAttached(),
         value: result.result.value,
+        authentication: authentication.result.value,
       };
     },
     { guestId },
   );
   NodeAssert.equal(controlled.value, "same native page");
-  NodeAssert.ok(requests.includes("/"), "The native page must request the real HTTP fixture.");
+  NodeAssert.equal(controlled.authentication, "signed-in");
+  NodeAssert.ok(
+    requests.includes("/login") && requests.includes("/protected"),
+    "The native profile must retain the fixture cookie before hidden recovery is tested.",
+  );
   report.checks.productionPreviewGuestAndCdp = controlled;
+  report.checks.nativeProfileCookieSeededBeforeHiddenRecovery = true;
   await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].minimize());
   const minimizedValue = await application.evaluate(
     async ({ webContents }, input) => {
