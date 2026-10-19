@@ -7,15 +7,14 @@ on:
         description: Optional upstream commit or ref to verify; empty builds this test branch.
         type: string
         default: ""
-  push:
-    branches: [test/packaged-browser-verification]
-    paths:
-      - .github/workflows/verify-packaged-browser.yml
-      - apps/desktop/scripts/verify-packaged-browser.mjs
-      - apps/server/scripts/verify-packaged-browser-mcp.mjs
+      candidate_run_id:
+        description: Optional run built in this fork with candidate_ref empty; verifies its packaged windows-native-candidate commit without rebuilding.
+        type: string
+        default: ""
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   windows:
@@ -27,6 +26,8 @@ jobs:
         env:
           GIT_TERMINAL_PROMPT: "0"
           CANDIDATE_REF: ${{ inputs.candidate_ref }}
+          CANDIDATE_RUN: ${{ inputs.candidate_run_id }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git init .
@@ -35,10 +36,21 @@ jobs:
           git fetch --no-tags --depth=1 origin "$GITHUB_SHA"
           git sparse-checkout set --no-cone '/*' '!/.repos/'
           git -c checkout.workers=0 checkout --detach FETCH_HEAD
-          if [[ -n "$CANDIDATE_REF" ]]; then
+          if [[ -n "$CANDIDATE_REF" && -n "$CANDIDATE_RUN" ]]; then
+            echo 'Choose a source ref or a packaged run, not both.' >&2
+            exit 1
+          fi
+          if [[ -n "$CANDIDATE_REF" || -n "$CANDIDATE_RUN" ]]; then
             cp apps/desktop/scripts/verify-packaged-browser.mjs "$RUNNER_TEMP/verify-packaged-browser.mjs"
             cp apps/server/scripts/verify-packaged-browser-mcp.mjs "$RUNNER_TEMP/verify-packaged-browser-mcp.mjs"
-            git fetch --no-tags --depth=1 https://github.com/pingdotgg/t3code.git "$CANDIDATE_REF"
+            if [[ -n "$CANDIDATE_RUN" ]]; then
+              [[ "$CANDIDATE_RUN" =~ ^[0-9]+$ ]]
+              candidate_sha=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN" --jq '.head_sha')
+              git fetch --no-tags --depth=1 origin "$candidate_sha"
+              gh run download "$CANDIDATE_RUN" --repo "$GITHUB_REPOSITORY" --name windows-native-candidate --dir release-native
+            else
+              git fetch --no-tags --depth=1 https://github.com/pingdotgg/t3code.git "$CANDIDATE_REF"
+            fi
             git -c checkout.workers=0 checkout --detach FETCH_HEAD
             cp "$RUNNER_TEMP/verify-packaged-browser.mjs" apps/desktop/scripts/verify-packaged-browser.mjs
             cp "$RUNNER_TEMP/verify-packaged-browser-mcp.mjs" apps/server/scripts/verify-packaged-browser-mcp.mjs
@@ -56,11 +68,13 @@ jobs:
         run: node apps/server/node_modules/playwright-core/cli.js install chromium
 
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        if: inputs.candidate_run_id == ''
         with:
           toolchain: stable
           targets: x86_64-pc-windows-msvc
 
       - name: Install native build prerequisite
+        if: inputs.candidate_run_id == ''
         shell: pwsh
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -70,19 +84,32 @@ jobs:
           if ($null -eq $proc -or $proc.ExitCode -ne 0) { throw "Native build prerequisite installation failed." }
 
       - name: Build the exact packaged candidate
+        if: inputs.candidate_run_id == ''
         run: vp run dist:desktop:artifact --platform win --target zip --arch x64 --keep-stage --output-dir release-native --verbose
+
+      - name: Unpack the selected existing candidate
+        if: inputs.candidate_run_id != ''
+        shell: pwsh
+        run: |
+          $archives = @(Get-ChildItem -Path release-native -File -Filter '*.zip')
+          if ($archives.Count -ne 1) { throw "Expected exactly one packaged archive." }
+          Expand-Archive -Path $archives[0].FullName -DestinationPath unpacked-native
 
       - name: Verify real Electron window and native preview guest
         timeout-minutes: 5
         shell: pwsh
         run: |
-          $stages = Get-ChildItem -Path ([System.IO.Path]::GetTempPath()) -Directory -Filter 't3code-desktop-win-stage-*'
-          $apps = @($stages | ForEach-Object { Get-ChildItem -Path (Join-Path $_.FullName 'app/dist/win-unpacked') -File -Filter '*.exe' -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch '^(Uninstall|chrome_crashpad_handler)' } })
+          if (Test-Path unpacked-native) {
+            $apps = @(Get-ChildItem -Path unpacked-native -Recurse -File -Filter '*.exe' | Where-Object { $_.Name -notmatch '^(Uninstall|chrome_crashpad_handler)' -and (Test-Path (Join-Path $_.DirectoryName 'resources/app.asar')) })
+          } else {
+            $stages = Get-ChildItem -Path ([System.IO.Path]::GetTempPath()) -Directory -Filter 't3code-desktop-win-stage-*'
+            $apps = @($stages | ForEach-Object { Get-ChildItem -Path (Join-Path $_.FullName 'app/dist/win-unpacked') -File -Filter '*.exe' -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch '^(Uninstall|chrome_crashpad_handler)' } })
+          }
           if ($apps.Count -ne 1) { throw "Expected exactly one freshly packaged app, found $($apps.Count)." }
           node apps/desktop/scripts/verify-packaged-browser.mjs $apps[0].FullName native-browser-evidence
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        if: always()
+        if: always() && inputs.candidate_run_id == ''
         with:
           name: windows-native-candidate
           path: release-native/*.zip
