@@ -74,7 +74,11 @@ try {
     };
   });
   NodeAssert.equal(identity.packaged, true);
-  NodeAssert.equal(identity.commit, sourceHead, "Packaged app must match the checked-out commit.");
+  NodeAssert.equal(
+    identity.commit,
+    sourceHead.slice(0, 12),
+    "Packaged app must match the checked-out commit.",
+  );
   NodeAssert.equal(NodePath.relative(appData, identity.userData).startsWith(".."), false);
   NodeAssert.notEqual(NodePath.relative(appData, identity.userData), "");
   NodeAssert.equal(NodePath.isAbsolute(NodePath.relative(appData, identity.userData)), false);
@@ -179,11 +183,11 @@ try {
   });
   process.exitCode = 1;
 } finally {
-  if (application) await application.close().catch(() => undefined);
-  await new Promise((resolve) => fixture.close(resolve));
   await NodeFSP.writeFile(
     NodePath.join(output, "report.json"),
     JSON.stringify(report, null, 2) + "\n",
   );
   console.log(JSON.stringify(report));
+  if (application) await application.close().catch(() => undefined);
+  await new Promise((resolve) => fixture.close(resolve));
 }
