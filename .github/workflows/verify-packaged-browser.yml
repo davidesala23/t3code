@@ -1,0 +1,66 @@
+name: Verify packaged native browser
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [test/packaged-browser-verification]
+    paths:
+      - .github/workflows/verify-packaged-browser.yml
+      - apps/desktop/scripts/verify-packaged-browser.mjs
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb
+        with:
+          node-version-file: package.json
+          cache: false
+          run-install: false
+
+      - run: vp install
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install native build prerequisite
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installPath = & $vswhere -products * -latest -property installationPath
+          $setupExe = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+          $proc = Start-Process -FilePath $setupExe -ArgumentList "modify", "--installPath", "`"$installPath`"", "--add", "Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre", "--quiet", "--norestart" -Wait -PassThru -NoNewWindow
+          if ($null -eq $proc -or $proc.ExitCode -ne 0) { throw "Native build prerequisite installation failed." }
+
+      - name: Build the exact packaged candidate
+        run: vp run dist:desktop:artifact --platform win --target zip --arch x64 --keep-stage --output-dir release-native --verbose
+
+      - name: Verify real Electron window and native preview guest
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $stages = Get-ChildItem -Path ([System.IO.Path]::GetTempPath()) -Directory -Filter 't3code-desktop-win-stage-*'
+          $apps = @($stages | ForEach-Object { Get-ChildItem -Path (Join-Path $_.FullName 'app/dist/win-unpacked') -File -Filter '*.exe' -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch '^(Uninstall|chrome_crashpad_handler)' } })
+          if ($apps.Count -ne 1) { throw "Expected exactly one freshly packaged app, found $($apps.Count)." }
+          node apps/desktop/scripts/verify-packaged-browser.mjs $apps[0].FullName native-browser-evidence
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: windows-native-browser-evidence
+          path: native-browser-evidence/
+          if-no-files-found: warn
