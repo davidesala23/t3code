@@ -71,7 +71,7 @@ jobs:
       - run: vp install
 
       - name: Verify the focused integration contracts
-        run: vp test run apps/server/src/preview/ServerBrowser.test.ts apps/web/src/browser/previewRuntime.test.ts packages/contracts/src/preview.test.ts
+        run: vp test run apps/server/src/preview/ServerBrowser.test.ts apps/web/src/browser/previewRuntime.test.ts packages/contracts/src/preview.test.ts packages/client-runtime/src/state/preview.test.ts
 
       - name: Install the normal headless fallback browser
         run: node apps/server/node_modules/playwright-core/cli.js install chromium
@@ -185,7 +185,7 @@ jobs:
       - run: vp install
 
       - name: Verify the focused integration contracts
-        run: vp test run apps/server/src/preview/ServerBrowser.test.ts apps/web/src/browser/previewRuntime.test.ts packages/contracts/src/preview.test.ts
+        run: vp test run apps/server/src/preview/ServerBrowser.test.ts apps/web/src/browser/previewRuntime.test.ts packages/contracts/src/preview.test.ts packages/client-runtime/src/state/preview.test.ts
 
       - name: Install the normal headless fallback browser
         run: node apps/server/node_modules/playwright-core/cli.js install chromium
