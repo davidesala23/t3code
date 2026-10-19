@@ -19,11 +19,6 @@ const isolated = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-native
 const appData = NodePath.join(isolated, "app-data");
 const serverHome = NodePath.join(isolated, "t3-home");
 await NodeFSP.mkdir(appData, { recursive: true });
-await NodeFSP.mkdir(NodePath.join(serverHome, "userdata"), { recursive: true });
-await NodeFSP.writeFile(
-  NodePath.join(serverHome, "userdata/client-settings.json"),
-  JSON.stringify({ confirmQuit: "direct" }),
-);
 const environment = Object.fromEntries(
   Object.entries(process.env).filter(([key]) =>
     /^(PATH|SYSTEMROOT|WINDIR|COMSPEC|PATHEXT|USERPROFILE|LOCALAPPDATA|TEMP|TMP|PROCESSOR_ARCHITECTURE|NUMBER_OF_PROCESSORS)$/i.test(
