@@ -57,6 +57,25 @@ const fixture = NodeHttp.createServer((request, response) => {
     `<!doctype html><title>Native browser verification</title><p id="auth">${signedIn ? "signed-in" : "signed-out"}</p><p id="page-id">${NodeCrypto.randomUUID()}</p><label>Draft <input id="draft"></label><button id="apply" onclick="document.querySelector('#result').textContent=document.querySelector('#draft').value">Apply</button><output id="result"></output>`,
   );
 });
+const waitForFixtureRequest = (pathname) => {
+  const completion = Promise.withResolvers();
+  const received = (request) => {
+    if (new URL(request.url, "http://fixture.invalid").pathname !== pathname) return;
+    close();
+    completion.resolve();
+  };
+  const timer = setTimeout(() => {
+    close();
+    completion.reject(new Error("The fixture did not observe the browser input."));
+  }, 30_000);
+  const close = () => {
+    clearTimeout(timer);
+    fixture.off("request", received);
+  };
+  fixture.on("request", received);
+  void completion.promise.catch(() => undefined);
+  return { promise: completion.promise, close };
+};
 await new Promise((resolve, reject) => {
   fixture.once("error", reject);
   fixture.listen(0, "127.0.0.1", resolve);
@@ -193,6 +212,7 @@ try {
     fixtureOrigin: origin,
     outputDir: output,
     checks: report.checks,
+    waitForFixtureRequest,
   });
   report.status = "passed";
 } catch (error) {

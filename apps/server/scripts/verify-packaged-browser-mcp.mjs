@@ -8,6 +8,60 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { DEFAULT_CLIENT_SETTINGS } from "@t3tools/contracts";
 import { execScriptSource, writeFakeCli } from "@t3tools/provider-testing/fakeCli";
+import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as Effect from "effect/Effect";
+
+function waitForRendererRpc(page, tag, accepts) {
+  const sockets = new Map();
+  let close;
+  const promise = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      close();
+      reject(new Error(`Renderer RPC milestone deadline: ${tag}`));
+    }, 60_000);
+    const onSocket = (socket) => {
+      const ids = new Set();
+      const messages = (frame) => {
+        if (typeof frame.payload !== "string") return [];
+        try {
+          const parsed = JSON.parse(frame.payload);
+          return Array.isArray(parsed) ? parsed : [parsed];
+        } catch {
+          return [];
+        }
+      };
+      const sent = (frame) => {
+        for (const message of messages(frame))
+          if (message._tag === "Request" && message.tag === tag && accepts(message.payload))
+            ids.add(String(message.id));
+      };
+      const received = (frame) => {
+        for (const message of messages(frame)) {
+          if (message._tag !== "Exit" || !ids.has(String(message.requestId))) continue;
+          close();
+          if (message.exit._tag === "Success") resolve();
+          else reject(new Error(`Renderer RPC milestone rejected: ${tag}`));
+          return;
+        }
+      };
+      sockets.set(socket, { sent, received });
+      socket.on("framesent", sent);
+      socket.on("framereceived", received);
+    };
+    close = () => {
+      clearTimeout(timer);
+      page.off("websocket", onSocket);
+      for (const [socket, handlers] of sockets) {
+        socket.off("framesent", handlers.sent);
+        socket.off("framereceived", handlers.received);
+      }
+      sockets.clear();
+    };
+    page.on("websocket", onSocket);
+  });
+  void promise.catch(() => undefined);
+  return { promise, close: () => close() };
+}
 
 function captureMcpConfiguration(directory, scriptPath) {
   let close;
@@ -127,6 +181,7 @@ async function connectRpc(bootstrap) {
 
 export async function verifyPackagedBrowserMcp(input) {
   const checks = input.checks;
+  const platform = await Effect.runPromise(HostProcess.Platform);
   const privateRoot = await NodeFSP.mkdtemp(NodePath.join(input.isolatedRoot, "mcp-private-"));
   const fixtureDirectory = NodeURL.fileURLToPath(
     new URL("../src/provider/testFixtures/", import.meta.url),
@@ -134,6 +189,7 @@ export async function verifyPackagedBrowserMcp(input) {
   const peerPath = NodePath.join(privateRoot, "codexCollabMockPeer.mjs");
   const scriptPath = NodePath.join(privateRoot, "script.json");
   const threadId = NodeCrypto.randomUUID();
+  const parkedThreadId = NodeCrypto.randomUUID();
   const projectId = NodeCrypto.randomUUID();
   const instanceId = `browser_fixture_${NodeCrypto.randomUUID()}`;
   const modelSelection = { instanceId, model: "gpt-5.6-sol" };
@@ -146,6 +202,7 @@ export async function verifyPackagedBrowserMcp(input) {
   let originalSettings;
   let providerCreated = false;
   let credentialCapture;
+  const rendererMilestones = [];
   const secrets = [];
   const progress = (name) => {
     phase = name;
@@ -234,26 +291,37 @@ export async function verifyPackagedBrowserMcp(input) {
       title: "Packaged browser proof",
       workspaceRoot,
     });
-    await rpc.request("orchestration.dispatchCommand", {
-      type: "thread.create",
-      commandId: NodeCrypto.randomUUID(),
-      threadId,
-      projectId,
-      title: "Synthetic native browser proof",
-      createdBy: "user",
-      creationSource: "web",
-      modelSelection,
-      runtimeMode: "full-access",
-      interactionMode: "default",
-      branch: null,
-      worktreePath: null,
-    });
+    const createThread = (id, title) =>
+      rpc.request("orchestration.dispatchCommand", {
+        type: "thread.create",
+        commandId: NodeCrypto.randomUUID(),
+        threadId: id,
+        projectId,
+        title,
+        createdBy: "user",
+        creationSource: "web",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+      });
+    await createThread(parkedThreadId, "Parked browser proof");
 
     progress("native profiles and React host");
     originalSettings = await input.mainWindow.evaluate(() =>
       window.desktopBridge.getClientSettings(),
     );
     const settings = { ...DEFAULT_CLIENT_SETTINGS, ...originalSettings };
+    const profilesReported = waitForRendererRpc(
+      input.mainWindow,
+      "preview.reportProfiles",
+      (payload) =>
+        [profileId, otherProfileId].every((id) =>
+          payload.profiles?.some((profile) => profile.id === id),
+        ),
+    );
+    rendererMilestones.push(profilesReported);
     await input.mainWindow.evaluate((next) => window.desktopBridge.setClientSettings(next), {
       ...settings,
       confirmQuit: "direct",
@@ -265,7 +333,7 @@ export async function verifyPackagedBrowserMcp(input) {
       ],
     });
     const target = new URL(input.mainWindow.url());
-    target.hash = `/${environmentId}/${threadId}`;
+    target.hash = `/${encodeURIComponent(environmentId)}/${encodeURIComponent(parkedThreadId)}`;
     await input.mainWindow.goto(target.href);
     await input.mainWindow.reload();
     await input.mainWindow.waitForFunction(
@@ -273,6 +341,10 @@ export async function verifyPackagedBrowserMcp(input) {
       undefined,
       { timeout: 60_000 },
     );
+    await profilesReported.promise;
+    // Creating this thread after the parked renderer is ready means its native
+    // preview host has never mounted. The real attach deadline can fall back.
+    await createThread(threadId, "Synthetic browser proof");
 
     progress("ordinary held-open provider turn");
     credentialCapture = captureMcpConfiguration(privateRoot, scriptPath);
@@ -322,6 +394,130 @@ export async function verifyPackagedBrowserMcp(input) {
       available.profiles?.some((profile) => profile.id === profileId),
       "The configured native browser profile must be available.",
     );
+
+    progress("genuine MCP desktop timeout fallback");
+    const hidden = await call("preview_open", {
+      open: false,
+      reuseExistingTab: false,
+      url: new URL("/public", input.fixtureOrigin).href,
+    });
+    NodeAssert.ok(hidden.tabId);
+    nativeTabIds.push(hidden.tabId);
+    NodeAssert.equal(hidden.serverPageMode, "headless", "An unvisited thread must fall back.");
+    const hiddenGuest = input.mainWindow.locator(
+      `webview[data-preview-server-tab="${hidden.tabId}"]`,
+    );
+    NodeAssert.equal(
+      await hiddenGuest.count(),
+      0,
+      "Hidden headless page must have no native guest.",
+    );
+    const readHeadless = async () =>
+      (
+        await call("preview_evaluate", {
+          tabId: hidden.tabId,
+          expression:
+            '({pageId: document.querySelector("#page-id").textContent, draft: document.querySelector("#draft").value, result: document.querySelector("#result").textContent})',
+        })
+      ).value;
+    const draft = "unsaved headless draft";
+    await call("preview_type", {
+      tabId: hidden.tabId,
+      selector: "#draft",
+      text: draft,
+      clear: true,
+    });
+    await call("preview_click", { tabId: hidden.tabId, selector: "#apply" });
+    const beforeReveal = await readHeadless();
+    NodeAssert.ok(beforeReveal.pageId);
+    NodeAssert.equal(beforeReveal.draft, draft);
+    NodeAssert.equal(beforeReveal.result, draft);
+    checks.genuineMcpDesktopTimeoutFallback = true;
+
+    progress("React reveal of the same headless page");
+    const targetListed = waitForRendererRpc(
+      input.mainWindow,
+      "preview.list",
+      (payload) => payload.threadId === threadId,
+    );
+    rendererMilestones.push(targetListed);
+    target.hash = `/${encodeURIComponent(environmentId)}/${encodeURIComponent(threadId)}`;
+    await input.mainWindow.goto(target.href);
+    await input.mainWindow.reload();
+    await targetListed.promise;
+    await input.mainWindow
+      .locator('[data-chat-header] button[aria-label="Thread actions for Synthetic browser proof"]')
+      .waitFor({ state: "visible" });
+    const shown = await call("preview_status", { tabId: hidden.tabId });
+    NodeAssert.equal(shown.tabId, hidden.tabId);
+    NodeAssert.equal(shown.serverPageMode, "headless");
+    await input.mainWindow.keyboard.press(
+      platform === "darwin" ? "Meta+Shift+j" : "Control+Shift+j",
+    );
+    await input.mainWindow
+      .locator(`[data-server-browser-surface="${hidden.tabId}"] canvas`)
+      .waitFor({ state: "visible", timeout: 30_000 });
+    await input.mainWindow
+      .getByRole("button", { name: "Float preview over chat", exact: true })
+      .click();
+    const surface = input.mainWindow.locator(
+      `[data-preview-mini-player="browser:${hidden.tabId}"] [data-server-browser-surface="${hidden.tabId}"]`,
+    );
+    await surface.locator("canvas").waitFor({ state: "visible", timeout: 30_000 });
+    await input.mainWindow.waitForFunction(
+      (tabId) => {
+        const canvas = document.querySelector(
+          `[data-preview-mini-player="browser:${tabId}"] [data-server-browser-surface="${tabId}"] canvas`,
+        );
+        return canvas?.getContext("2d")?.getImageData(0, 0, 1, 1).data[3] > 0;
+      },
+      hidden.tabId,
+      { timeout: 30_000 },
+    );
+    NodeAssert.equal(await hiddenGuest.count(), 0, "Revealed headless page must remain streamed.");
+    NodeAssert.deepEqual(
+      await readHeadless(),
+      beforeReveal,
+      "Reveal must preserve the page and draft.",
+    );
+    checks.genuineMcpHeadlessRevealPreservesPage = true;
+
+    // Observe the fixture's normal input event over HTTP before releasing
+    // control, so release cannot cancel keyboard work still queued remotely.
+    await call("preview_click", { tabId: hidden.tabId, selector: "#draft" });
+    const inputPathname = `/input-${NodeCrypto.randomUUID()}`;
+    const typed = input.waitForFixtureRequest(inputPathname);
+    try {
+      await call("preview_evaluate", {
+        tabId: hidden.tabId,
+        expression: `(() => { const input = document.querySelector("#draft"); const onInput = () => { if (input.value !== ${JSON.stringify(`${draft}-human`)}) return; input.removeEventListener("input", onInput); void fetch(${JSON.stringify(inputPathname)}).catch(() => undefined); }; input.addEventListener("input", onInput); return true; })()`,
+      });
+      await surface.getByRole("button", { name: "Take control", exact: true }).click();
+      const release = surface.getByRole("button", { name: "Release control", exact: true });
+      await release.waitFor({ state: "visible" });
+      const keyboard = surface.getByRole("textbox", { name: "Browser page", exact: true });
+      await keyboard.focus();
+      await keyboard.press("End");
+      await keyboard.pressSequentially("-human");
+      await typed.promise;
+      await release.click();
+    } finally {
+      typed.close();
+    }
+    await surface
+      .getByRole("button", { name: "Take control", exact: true })
+      .waitFor({ state: "visible" });
+    const afterTyping = await readHeadless();
+    NodeAssert.equal(afterTyping.pageId, beforeReveal.pageId);
+    NodeAssert.equal(afterTyping.draft, `${draft}-human`);
+    NodeAssert.equal(afterTyping.result, draft);
+    checks.genuineMcpHeadlessReactKeyboardInput = true;
+    await input.mainWindow.screenshot({
+      path: NodePath.join(input.outputDir, "genuine-mcp-headless.png"),
+    });
+    await call("t3_preview_close", { tabId: hidden.tabId });
+    nativeTabIds.splice(nativeTabIds.indexOf(hidden.tabId), 1);
+
     const open = async (profile, pathname) => {
       const status = await call("preview_open", {
         profileId: profile,
@@ -338,22 +534,32 @@ export async function verifyPackagedBrowserMcp(input) {
       );
       const guest = input.mainWindow.locator(`webview[data-preview-server-tab="${status.tabId}"]`);
       await guest.waitFor({ state: "attached", timeout: 30_000 });
+      const nativeDraft = `native input ${pathname}`;
+      await call("preview_type", {
+        tabId: status.tabId,
+        selector: "#draft",
+        text: nativeDraft,
+        clear: true,
+      });
+      await call("preview_click", { tabId: status.tabId, selector: "#apply" });
+      const expression =
+        '({auth: document.querySelector("#auth")?.textContent, pageId: document.querySelector("#page-id")?.textContent, draft: document.querySelector("#draft").value, result: document.querySelector("#result").textContent})';
       const evaluated = await call("preview_evaluate", {
         tabId: status.tabId,
-        expression:
-          '({auth: document.querySelector("#auth")?.textContent, pageId: document.querySelector("#page-id")?.textContent})',
+        expression,
       });
       const value = evaluated.value;
-      const visible = await guest.evaluate((element) =>
-        element.executeJavaScript(
-          '({auth: document.querySelector("#auth")?.textContent, pageId: document.querySelector("#page-id")?.textContent})',
-        ),
+      const visible = await guest.evaluate(
+        (element, expression) => element.executeJavaScript(expression),
+        expression,
       );
       NodeAssert.deepEqual(
         value,
         visible,
         "Real MCP and the React-mounted native guest must see one page.",
       );
+      NodeAssert.equal(value.draft, nativeDraft);
+      NodeAssert.equal(value.result, nativeDraft);
       return { tabId: status.tabId, value };
     };
 
@@ -366,6 +572,7 @@ export async function verifyPackagedBrowserMcp(input) {
     NodeAssert.equal(restored.value.auth, "signed-in");
     checks.genuineMcpNativeCookieReuse = true;
     checks.genuineMcpAndReactShareNativePage = true;
+    checks.genuineMcpNativeTypeAndClick = true;
     progress("genuine MCP profile isolation");
     const other = await open(otherProfileId, "/protected");
     NodeAssert.equal(other.value.auth, "signed-out");
@@ -430,5 +637,6 @@ export async function verifyPackagedBrowserMcp(input) {
         )
         .catch(() => undefined);
     credentialCapture?.close();
+    for (const milestone of rendererMilestones) milestone.close();
   }
 }
