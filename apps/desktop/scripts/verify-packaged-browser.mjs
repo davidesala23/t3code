@@ -3,12 +3,16 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeCrypto from "node:crypto";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeHttp from "node:http";
+import * as NodeModule from "node:module";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
 import { _electron } from "playwright-core";
 
+const Asar = NodeModule.createRequire(new URL("../../../scripts/package.json", import.meta.url))(
+  "@electron/asar",
+);
 const executablePath = process.argv[2];
 NodeAssert.ok(executablePath, "Pass the packaged executable path.");
 const platform = await Effect.runPromise(HostProcess.Platform);
@@ -45,6 +49,7 @@ await new Promise((resolve, reject) => {
 const origin = `http://127.0.0.1:${fixture.address().port}`;
 const report = {
   sourceHead,
+  verifierHead: process.env.GITHUB_SHA ?? sourceHead,
   platform,
   scope: "packaged native environment preflight",
   checks: {},
@@ -61,18 +66,14 @@ try {
   await window.waitForFunction(() => Boolean(window.desktopBridge?.preview), undefined, {
     timeout: 60_000,
   });
-  const identity = await application.evaluate(async ({ app }) => {
-    const nodeFs = await import("node:fs/promises");
-    const nodePath = await import("node:path");
-    const manifest = JSON.parse(
-      await nodeFs.readFile(nodePath.join(app.getAppPath(), "package.json"), "utf8"),
-    );
-    return {
-      packaged: app.isPackaged,
-      userData: app.getPath("userData"),
-      commit: manifest.t3codeCommitHash,
-    };
-  });
+  const identity = await application.evaluate(({ app }) => ({
+    packaged: app.isPackaged,
+    userData: app.getPath("userData"),
+    archive: app.getAppPath(),
+  }));
+  identity.commit = JSON.parse(
+    Asar.extractFile(identity.archive, "package.json").toString(),
+  ).t3codeCommitHash;
   NodeAssert.equal(identity.packaged, true);
   NodeAssert.equal(
     identity.commit,
@@ -182,6 +183,12 @@ try {
     }
   });
   process.exitCode = 1;
+  const failedWindow = application?.windows()[0];
+  if (failedWindow) {
+    await failedWindow
+      .screenshot({ path: NodePath.join(output, "failed-window.png"), timeout: 5_000 })
+      .catch(() => undefined);
+  }
 } finally {
   await NodeFSP.writeFile(
     NodePath.join(output, "report.json"),

@@ -2,6 +2,11 @@ name: Verify packaged native browser
 
 on:
   workflow_dispatch:
+    inputs:
+      candidate_ref:
+        description: Optional upstream commit or ref to verify; empty builds this test branch.
+        type: string
+        default: ""
   push:
     branches: [test/packaged-browser-verification]
     paths:
@@ -20,6 +25,7 @@ jobs:
         shell: bash
         env:
           GIT_TERMINAL_PROMPT: "0"
+          CANDIDATE_REF: ${{ inputs.candidate_ref }}
         run: |
           set -euo pipefail
           git init .
@@ -28,6 +34,12 @@ jobs:
           git fetch --no-tags --depth=1 origin "$GITHUB_SHA"
           git sparse-checkout set --no-cone '/*' '!/.repos/'
           git -c checkout.workers=0 checkout --detach FETCH_HEAD
+          if [[ -n "$CANDIDATE_REF" ]]; then
+            cp apps/desktop/scripts/verify-packaged-browser.mjs "$RUNNER_TEMP/verify-packaged-browser.mjs"
+            git fetch --no-tags --depth=1 https://github.com/pingdotgg/t3code.git "$CANDIDATE_REF"
+            git -c checkout.workers=0 checkout --detach FETCH_HEAD
+            cp "$RUNNER_TEMP/verify-packaged-browser.mjs" apps/desktop/scripts/verify-packaged-browser.mjs
+          fi
 
       - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb
         with:
@@ -62,6 +74,14 @@ jobs:
           $apps = @($stages | ForEach-Object { Get-ChildItem -Path (Join-Path $_.FullName 'app/dist/win-unpacked') -File -Filter '*.exe' -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch '^(Uninstall|chrome_crashpad_handler)' } })
           if ($apps.Count -ne 1) { throw "Expected exactly one freshly packaged app, found $($apps.Count)." }
           node apps/desktop/scripts/verify-packaged-browser.mjs $apps[0].FullName native-browser-evidence
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: windows-native-candidate
+          path: release-native/*.zip
+          if-no-files-found: warn
+          retention-days: 3
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
