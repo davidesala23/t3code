@@ -1,13 +1,6 @@
 import { scopedThreadKey } from "@t3tools/client-runtime/environment";
 import { EnvironmentId, ThreadId, type PreviewSessionSnapshot } from "@t3tools/contracts";
-import {
-  act,
-  createElement,
-  useEffect,
-  useImperativeHandle,
-  type ComponentProps,
-  type ReactNode,
-} from "react";
+import { act, createElement, useEffect, useImperativeHandle, type ComponentProps } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import type { HostedBrowserWebview } from "~/browser/HostedBrowserWebview";
@@ -54,13 +47,20 @@ function previewState() {
 }
 
 vi.mock("~/env", () => ({ isElectron: true }));
-vi.mock("@effect/atom-react", () => ({ useAtomValue: () => threadRef.environmentId }));
+vi.mock("@effect/atom-react", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@effect/atom-react")>()),
+  useAtomValue: () => threadRef.environmentId,
+}));
 vi.mock("~/state/primaryEnvironment", () => ({ primaryEnvironmentIdAtom: {} }));
+vi.mock("~/state/environments", () => ({
+  useEnvironmentHttpBaseUrl: () => "http://localhost:3773",
+}));
 vi.mock("~/state/entities", () => ({
   readEnvironmentSupportsServerBrowser: () => true,
   useEnvironmentSupportsServerBrowser: () => true,
 }));
-vi.mock("~/previewStateStore", () => ({
+vi.mock("~/previewStateStore", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("~/previewStateStore")>()),
   useThreadPreviewState: previewState,
   useActivePreviewSessions: () => ({ [scopedThreadKey(threadRef)]: previewState() }),
   isPreviewSupportedInRuntime: () => true,
@@ -141,14 +141,6 @@ vi.mock("~/state/device", () => ({
   useDeviceState: () => ({ state: { devices: [], hosts: [] } }),
 }));
 vi.mock("../device/DeviceStreamView", () => ({ DeviceStreamView: () => null }));
-vi.mock("~/components/ui/button", () => ({
-  Button: (props: ComponentProps<"button">) => createElement("button", props),
-}));
-vi.mock("~/components/ui/tooltip", () => ({
-  Tooltip: (props: { children: ReactNode }) => props.children,
-  TooltipTrigger: (props: { render: ReactNode }) => props.render,
-  TooltipPopup: () => null,
-}));
 
 import { ElectronBrowserHost } from "~/browser/ElectronBrowserHost";
 import { ThreadPreviewMiniPlayer } from "./ThreadPreviewMiniPlayer";
