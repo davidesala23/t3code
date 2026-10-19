@@ -9,6 +9,7 @@ import * as NodePath from "node:path";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
 import { _electron } from "playwright-core";
+import { verifyPackagedBrowserMcp } from "../../server/scripts/verify-packaged-browser-mcp.mjs";
 
 const Asar = NodeModule.createRequire(new URL("../../../scripts/package.json", import.meta.url))(
   "@electron/asar",
@@ -30,16 +31,30 @@ const environment = Object.fromEntries(
     ),
   ),
 );
-Object.assign(environment, { APPDATA: appData, T3CODE_HOME: serverHome });
+Object.assign(environment, {
+  APPDATA: appData,
+  T3CODE_HOME: serverHome,
+  T3CODE_DISABLE_AUTO_UPDATE: "1",
+});
 const sourceHead = NodeChildProcess.execFileSync("git", ["rev-parse", "HEAD"], {
   encoding: "utf8",
 }).trim();
 const requests = [];
 const fixture = NodeHttp.createServer((request, response) => {
-  requests.push(request.url);
+  const pathname = new URL(request.url, "http://fixture.invalid").pathname;
+  requests.push(pathname);
   response.setHeader("content-type", "text/html; charset=utf-8");
+  const signedIn =
+    pathname === "/login" ||
+    /(?:^|;\s*)native_fixture_session=synthetic-login(?:;|$)/.test(request.headers.cookie ?? "");
+  if (pathname === "/login") {
+    response.setHeader(
+      "set-cookie",
+      "native_fixture_session=synthetic-login; Path=/; HttpOnly; SameSite=Lax",
+    );
+  }
   response.end(
-    '<!doctype html><title>Native browser verification</title><label>Draft <input id="draft"></label><button id="apply" onclick="document.querySelector(\'#result\').textContent=document.querySelector(\'#draft\').value">Apply</button><output id="result"></output>',
+    `<!doctype html><title>Native browser verification</title><p id="auth">${signedIn ? "signed-in" : "signed-out"}</p><p id="page-id">${NodeCrypto.randomUUID()}</p><label>Draft <input id="draft"></label><button id="apply" onclick="document.querySelector('#result').textContent=document.querySelector('#draft').value">Apply</button><output id="result"></output>`,
   );
 });
 await new Promise((resolve, reject) => {
@@ -171,17 +186,27 @@ try {
     await window.desktopBridge.preview.closeTab(id);
     document.querySelector("#packaged-native-proof").remove();
   }, runtimeTabId);
+  report.scope = "packaged native preflight and live MCP browser checks";
+  await verifyPackagedBrowserMcp({
+    mainWindow: window,
+    isolatedRoot: isolated,
+    fixtureOrigin: origin,
+    outputDir: output,
+    checks: report.checks,
+  });
   report.status = "passed";
 } catch (error) {
   report.status = "failed";
-  report.error = String(error.stack ?? error).replace(/https?:\/\/[^\s"'<>]+/g, (value) => {
-    try {
-      const url = new URL(value);
-      return url.origin + url.pathname;
-    } catch {
-      return "[redacted URL]";
-    }
-  });
+  report.error = String(error.stack ?? error)
+    .replace(/Bearer\s+[^\s"'<>]+/gi, "Bearer [redacted]")
+    .replace(/https?:\/\/[^\s"'<>]+/g, (value) => {
+      try {
+        const url = new URL(value);
+        return url.origin + url.pathname;
+      } catch {
+        return "[redacted URL]";
+      }
+    });
   process.exitCode = 1;
   const failedWindow = application?.windows()[0];
   if (failedWindow) {
@@ -197,4 +222,5 @@ try {
   console.log(JSON.stringify(report));
   if (application) await application.close().catch(() => undefined);
   await new Promise((resolve) => fixture.close(resolve));
+  await NodeFSP.rm(isolated, { recursive: true, force: true });
 }
