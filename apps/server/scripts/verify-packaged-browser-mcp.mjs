@@ -13,30 +13,60 @@ import * as Effect from "effect/Effect";
 
 function waitForRendererRpc(page, tag, accepts) {
   const sockets = new Map();
+  const observedRequestTags = new Set();
+  const diagnostics = {
+    socketCount: 0,
+    sentFrameCount: 0,
+    receivedFrameCount: 0,
+    sentStringFrameCount: 0,
+    sentBufferFrameCount: 0,
+    receivedStringFrameCount: 0,
+    receivedBufferFrameCount: 0,
+    parseFailureCount: 0,
+    acceptedRequestCount: 0,
+    exitCount: 0,
+  };
   let close;
   const promise = new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       close();
-      reject(new Error(`Renderer RPC milestone deadline: ${tag}`));
+      reject(
+        new Error(
+          `Renderer RPC milestone deadline: ${tag}; ${JSON.stringify({ ...diagnostics, observedRequestTags: [...observedRequestTags].sort() })}`,
+        ),
+      );
     }, 60_000);
     const onSocket = (socket) => {
+      diagnostics.socketCount++;
       const ids = new Set();
-      const messages = (frame) => {
-        if (typeof frame.payload !== "string") return [];
+      const messages = (frame, direction) => {
+        diagnostics[`${direction}FrameCount`]++;
+        if (typeof frame.payload !== "string") {
+          diagnostics[`${direction}BufferFrameCount`]++;
+          return [];
+        }
+        diagnostics[`${direction}StringFrameCount`]++;
         try {
           const parsed = JSON.parse(frame.payload);
           return Array.isArray(parsed) ? parsed : [parsed];
         } catch {
+          diagnostics.parseFailureCount++;
           return [];
         }
       };
       const sent = (frame) => {
-        for (const message of messages(frame))
-          if (message._tag === "Request" && message.tag === tag && accepts(message.payload))
+        for (const message of messages(frame, "sent")) {
+          if (message._tag === "Request" && typeof message.tag === "string")
+            observedRequestTags.add(message.tag);
+          if (message._tag === "Request" && message.tag === tag && accepts(message.payload)) {
+            diagnostics.acceptedRequestCount++;
             ids.add(String(message.id));
+          }
+        }
       };
       const received = (frame) => {
-        for (const message of messages(frame)) {
+        for (const message of messages(frame, "received")) {
+          if (message._tag === "Exit") diagnostics.exitCount++;
           if (message._tag !== "Exit" || !ids.has(String(message.requestId))) continue;
           close();
           if (message.exit._tag === "Success") resolve();
@@ -208,6 +238,16 @@ export async function verifyPackagedBrowserMcp(input) {
     phase = name;
     console.log(`[packaged-mcp] ${name}`);
   };
+  const observeProfileSettings = async (key) => {
+    const ids = await input.mainWindow.evaluate(async () => {
+      const settings = await window.desktopBridge.getClientSettings();
+      return settings?.browserProfiles?.map((profile) => profile.id) ?? [];
+    });
+    const syntheticIds = ids.filter((id) => id === profileId || id === otherProfileId);
+    checks.profileSettingsIds = syntheticIds;
+    checks[key] = syntheticIds;
+    checks.rendererHash = new URL(input.mainWindow.url()).hash;
+  };
   try {
     const peer = await NodeFSP.readFile(
       NodePath.join(fixtureDirectory, "codexCollabMockPeer.mjs"),
@@ -260,6 +300,7 @@ export async function verifyPackagedBrowserMcp(input) {
     rpc = await connectRpc(bootstrap);
     const config = await rpc.request("server.getConfig", {});
     const environmentId = config.environment.environmentId;
+    checks.serverBrowserCapability = config.environment.capabilities.serverBrowser === true;
     const workspaceRoot = NodePath.join(privateRoot, "workspace");
     await NodeFSP.mkdir(workspaceRoot);
 
@@ -332,6 +373,7 @@ export async function verifyPackagedBrowserMcp(input) {
         { id: otherProfileId, name: "Other proof", kind: "persistent" },
       ],
     });
+    await observeProfileSettings("profileSettingsAfterSetIds");
     const target = new URL(input.mainWindow.url());
     target.hash = `/${encodeURIComponent(environmentId)}/${encodeURIComponent(parkedThreadId)}`;
     await input.mainWindow.goto(target.href);
@@ -341,6 +383,7 @@ export async function verifyPackagedBrowserMcp(input) {
       undefined,
       { timeout: 60_000 },
     );
+    await observeProfileSettings("profileSettingsAfterReloadIds");
     await profilesReported.promise;
     // Creating this thread after the parked renderer is ready means its native
     // preview host has never mounted. The real attach deadline can fall back.
@@ -584,6 +627,9 @@ export async function verifyPackagedBrowserMcp(input) {
     checks.genuineMcpTabsClosed = true;
     return { checks, threadId, nativeTabIds: [] };
   } catch (error) {
+    await observeProfileSettings("profileSettingsAtFailureIds").catch(() => {
+      checks.profileSettingsFailureReadbackFailed = true;
+    });
     let detail = String(error.message ?? error);
     for (const secret of secrets) if (secret) detail = detail.replaceAll(secret, "[redacted]");
     detail = detail.replace(/Bearer\s+[^\s"'<>]+/g, "Bearer [redacted]");
