@@ -566,20 +566,22 @@ export async function verifyPackagedBrowserMcp(input) {
       const guest = input.mainWindow.locator(`webview[data-preview-server-tab="${status.tabId}"]`);
       await guest.waitFor({ state: "attached", timeout: 30_000 });
       const nativeDraft = `native input ${pathname}`;
+      const expression =
+        '({auth: document.querySelector("#auth")?.textContent, pageId: document.querySelector("#page-id")?.textContent, draft: document.querySelector("#draft")?.value, result: document.querySelector("#result")?.textContent, activeElementId: document.activeElement?.id, hasFocus: document.hasFocus()})';
+      const readNative = async () =>
+        (await call("preview_evaluate", { tabId: status.tabId, expression })).value;
+      const stages = { pathname, beforeType: await readNative() };
+      (checks.nativeInteractionStages ??= []).push(stages);
       await call("preview_type", {
         tabId: status.tabId,
         selector: "#draft",
         text: nativeDraft,
         clear: true,
       });
+      stages.afterType = await readNative();
       await call("preview_click", { tabId: status.tabId, selector: "#apply" });
-      const expression =
-        '({auth: document.querySelector("#auth")?.textContent, pageId: document.querySelector("#page-id")?.textContent, draft: document.querySelector("#draft").value, result: document.querySelector("#result").textContent})';
-      const evaluated = await call("preview_evaluate", {
-        tabId: status.tabId,
-        expression,
-      });
-      const value = evaluated.value;
+      const value = await readNative();
+      stages.afterClick = value;
       const visible = await guest.evaluate(
         (element, expression) => element.executeJavaScript(expression),
         expression,
@@ -589,8 +591,16 @@ export async function verifyPackagedBrowserMcp(input) {
         visible,
         "Real MCP and the React-mounted native guest must see one page.",
       );
-      NodeAssert.equal(value.draft, nativeDraft);
-      NodeAssert.equal(value.result, nativeDraft);
+      NodeAssert.equal(
+        value.draft,
+        nativeDraft,
+        `Native draft must retain typed input: ${pathname}`,
+      );
+      NodeAssert.equal(
+        value.result,
+        nativeDraft,
+        `Native Apply must show the typed input: ${pathname}`,
+      );
       return { tabId: status.tabId, value };
     };
 

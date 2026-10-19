@@ -256,6 +256,7 @@ try {
       .catch(() => undefined);
   }
 } finally {
+  report.fixtureRequests = requests;
   await NodeFSP.writeFile(
     NodePath.join(output, "report.json"),
     JSON.stringify(report, null, 2) + "\n",
