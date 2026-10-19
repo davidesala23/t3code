@@ -6,7 +6,6 @@ import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { DEFAULT_CLIENT_SETTINGS } from "@t3tools/contracts";
 import { execScriptSource, writeFakeCli } from "@t3tools/provider-testing/fakeCli";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
@@ -223,13 +222,12 @@ export async function verifyPackagedBrowserMcp(input) {
   const projectId = NodeCrypto.randomUUID();
   const instanceId = `browser_fixture_${NodeCrypto.randomUUID()}`;
   const modelSelection = { instanceId, model: "gpt-5.6-sol" };
-  const profileId = `native-${NodeCrypto.randomUUID()}`;
-  const otherProfileId = `other-${NodeCrypto.randomUUID()}`;
+  const profileId = input.profileId;
+  const otherProfileId = input.otherProfileId;
   const nativeTabIds = [];
   let phase = "fixture preparation";
   let rpc;
   let client;
-  let originalSettings;
   let providerCreated = false;
   let credentialCapture;
   const rendererMilestones = [];
@@ -350,10 +348,11 @@ export async function verifyPackagedBrowserMcp(input) {
     await createThread(parkedThreadId, "Parked browser proof");
 
     progress("native profiles and React host");
-    originalSettings = await input.mainWindow.evaluate(() =>
-      window.desktopBridge.getClientSettings(),
+    await observeProfileSettings("profileSettingsBeforeReloadIds");
+    NodeAssert.ok(
+      [profileId, otherProfileId].every((id) => checks.profileSettingsIds.includes(id)),
+      "The isolated app must start with both configured browser profiles.",
     );
-    const settings = { ...DEFAULT_CLIENT_SETTINGS, ...originalSettings };
     const profilesReported = waitForRendererRpc(
       input.mainWindow,
       "preview.reportProfiles",
@@ -363,17 +362,6 @@ export async function verifyPackagedBrowserMcp(input) {
         ),
     );
     rendererMilestones.push(profilesReported);
-    await input.mainWindow.evaluate((next) => window.desktopBridge.setClientSettings(next), {
-      ...settings,
-      confirmQuit: "direct",
-      browserAutoShowFloatingPreview: false,
-      browserProfiles: [
-        ...settings.browserProfiles,
-        { id: profileId, name: "Native proof", kind: "persistent" },
-        { id: otherProfileId, name: "Other proof", kind: "persistent" },
-      ],
-    });
-    await observeProfileSettings("profileSettingsAfterSetIds");
     const target = new URL(input.mainWindow.url());
     target.hash = `/${encodeURIComponent(environmentId)}/${encodeURIComponent(parkedThreadId)}`;
     await input.mainWindow.goto(target.href);
@@ -675,13 +663,6 @@ export async function verifyPackagedBrowserMcp(input) {
           .catch(() => undefined);
       rpc.close();
     }
-    if (originalSettings !== undefined)
-      await input.mainWindow
-        .evaluate(
-          (settings) => window.desktopBridge.setClientSettings(settings),
-          originalSettings ?? DEFAULT_CLIENT_SETTINGS,
-        )
-        .catch(() => undefined);
     credentialCapture?.close();
     for (const milestone of rendererMilestones) milestone.close();
   }

@@ -6,6 +6,7 @@ import * as NodeHttp from "node:http";
 import * as NodeModule from "node:module";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import { DEFAULT_CLIENT_SETTINGS } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
 import { _electron } from "playwright-core";
@@ -23,7 +24,25 @@ await NodeFSP.mkdir(output, { recursive: true });
 const isolated = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-native-browser-proof-"));
 const appData = NodePath.join(isolated, "app-data");
 const serverHome = NodePath.join(isolated, "t3-home");
+const profileId = `native-${NodeCrypto.randomUUID()}`;
+const otherProfileId = `other-${NodeCrypto.randomUUID()}`;
 await NodeFSP.mkdir(appData, { recursive: true });
+await NodeFSP.mkdir(NodePath.join(serverHome, "userdata"), { recursive: true });
+await NodeFSP.writeFile(
+  NodePath.join(serverHome, "userdata", "client-settings.json"),
+  JSON.stringify({
+    ...DEFAULT_CLIENT_SETTINGS,
+    onboardingCompletedAt: new Date().toISOString(),
+    confirmQuit: "direct",
+    browserAutoShowFloatingPreview: false,
+    browserProfiles: [
+      ...DEFAULT_CLIENT_SETTINGS.browserProfiles,
+      { id: profileId, name: "Native proof", kind: "persistent" },
+      { id: otherProfileId, name: "Other proof", kind: "persistent" },
+    ],
+  }),
+  { mode: 0o600 },
+);
 const environment = Object.fromEntries(
   Object.entries(process.env).filter(([key]) =>
     /^(PATH|SYSTEMROOT|WINDIR|COMSPEC|PATHEXT|USERPROFILE|LOCALAPPDATA|TEMP|TMP|PROCESSOR_ARCHITECTURE|NUMBER_OF_PROCESSORS)$/i.test(
@@ -212,6 +231,8 @@ try {
     fixtureOrigin: origin,
     outputDir: output,
     checks: report.checks,
+    profileId,
+    otherProfileId,
     waitForFixtureRequest,
   });
   report.status = "passed";
