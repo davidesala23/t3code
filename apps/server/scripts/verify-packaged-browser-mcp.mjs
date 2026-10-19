@@ -27,31 +27,35 @@ const observeNativeGuestDestruction = (application, ids) =>
       debuggerAttached: guest.debugger.isAttached(),
     }));
     const completion = Promise.all(
-      guests.map(
-        (guest) =>
-          new Promise((resolve, reject) => {
-            let debuggerDetached = !guest.debugger.isAttached();
-            const detached = () => {
-              debuggerDetached = true;
-            };
-            const cleanup = () => {
-              clearTimeout(timer);
-              guest.debugger.off("detach", detached);
-              guest.off("destroyed", destroyed);
-            };
-            const destroyed = () => {
+      guests.map((guest) => {
+        const debuggee = guest.debugger;
+        return new Promise((resolve, reject) => {
+          let debuggerDetached = !debuggee.isAttached();
+          const detached = () => {
+            debuggerDetached = true;
+          };
+          const cleanup = () => {
+            clearTimeout(timer);
+            debuggee.off("detach", detached);
+            guest.off("destroyed", destroyed);
+          };
+          const destroyed = () => {
+            try {
               cleanup();
               resolve({ id: guest.id, isDestroyed: guest.isDestroyed(), debuggerDetached });
-            };
-            const timer = setTimeout(() => {
-              cleanup();
-              reject(new Error(`Native guest destruction deadline: ${guest.id}`));
-            }, 30_000);
-            guest.debugger.on("detach", detached);
-            guest.once("destroyed", destroyed);
-            if (guest.isDestroyed()) destroyed();
-          }),
-      ),
+            } catch (error) {
+              reject(error);
+            }
+          };
+          const timer = setTimeout(() => {
+            cleanup();
+            reject(new Error(`Native guest destruction deadline: ${guest.id}`));
+          }, 30_000);
+          debuggee.on("detach", detached);
+          guest.once("destroyed", destroyed);
+          if (guest.isDestroyed()) destroyed();
+        });
+      }),
     ).then((destroyed) => ({
       before,
       destroyed,
