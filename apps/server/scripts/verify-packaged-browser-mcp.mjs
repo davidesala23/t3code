@@ -970,6 +970,12 @@ export async function verifyPackagedBrowserMcp(input) {
             tabId: status.tabId,
             expression: `(() => { const input = document.querySelector("#draft"); const listener = () => { if(input.value !== ${JSON.stringify(target)}) return; input.removeEventListener("input", listener); void fetch(${JSON.stringify(inputPath)}).catch(() => undefined); }; input.addEventListener("input", listener); return true; })()`,
           });
+          for (const notification of await remote
+            .getByRole("button", { name: "Dismiss notification", exact: true })
+            .elementHandles()) {
+            await notification.click();
+            await notification.waitForElementState("hidden");
+          }
           await surface.getByRole("button", { name: "Take control", exact: true }).click();
           await surface
             .getByRole("button", { name: "Release control", exact: true })
@@ -998,6 +1004,12 @@ export async function verifyPackagedBrowserMcp(input) {
         );
         checks.genuinePairedWebClientSharesDesktopNativePage = true;
         await remote.screenshot({ path: NodePath.join(input.outputDir, "genuine-remote-web.png") });
+      } catch (error) {
+        if (remote && checks.genuinePairedWebClientAuthenticated)
+          await remote
+            .screenshot({ path: NodePath.join(input.outputDir, "failed-remote-web.png") })
+            .catch(() => undefined);
+        throw error;
       } finally {
         if (
           surface &&
